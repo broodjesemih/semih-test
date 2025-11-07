@@ -41,7 +41,7 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 	[Export] public bool DrawLevelLines { get; set; } = true;
 	[Export] public float LevelEpsilon { get; set; } = 0.25f;      // punten horen samen als |ΔY| <= epsilon (20cm voor trapmetingen met meetfouten)
 	[Export] public float LineRadius { get; set; } = 0.01f;        // "dikte" van de lijn (cilinder)
-	[Export] public Color LineColor { get; set; } = new Color(0, 1, 0);
+	[Export] public Color LineColor { get; set; } = new Color(224, 108, 0);
 	
 	// Debug Mode - toggle groene vectoren
 	private bool _debugMode = false;
@@ -110,6 +110,16 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 		if (index >= 0 && index < _currentCornerPoints.Count)
 		{
 			_currentCornerPoints[index] = newPosition;
+		}
+	}
+	
+	// Insert een nieuw punt op een specifieke index (voor spawnen van nieuwe punten in edit mode)
+	public void InsertPoint(int index, Vector3 position)
+	{
+		if (index >= 0 && index <= _currentPoints.Count)
+		{
+			_currentPoints.Insert(index, position);
+			GD.Print($"[CsvPointPlacer] Nieuw punt ingevoegd op index {index} op positie {position}");
 		}
 	}
 	

@@ -19,6 +19,14 @@ public partial class EditModeManager : Node3D
 	private Vector3 _dragOffset;
 	private float _lockedYHeight; // Vergrendelde hoogte tijdens drag
 	private List<EditablePoint> _linkedPoints = new List<EditablePoint>(); // Punten die mee moeten bewegen
+	
+	// Voor het spawnen van nieuwe punten op lijnen
+	private List<(Vector3 start, Vector3 end, int startIndex, int endIndex)> _lineSegments = new List<(Vector3, Vector3, int, int)>();
+	
+	// Confirmation dialog voor nieuwe punten
+	private ConfirmationDialog _spawnConfirmDialog;
+	private Vector3 _pendingSpawnPosition;
+	private int _pendingInsertIndex;
 
 	public bool IsEditMode { get; private set; } = false;
 
@@ -29,6 +37,48 @@ public partial class EditModeManager : Node3D
 		
 		_editPointsParent = new Node3D { Name = "EditPoints" };
 		AddChild(_editPointsParent);
+		
+		// Maak confirmation dialog aan voor spawning
+		CreateSpawnConfirmDialog();
+	}
+	
+	private void CreateSpawnConfirmDialog()
+	{
+		_spawnConfirmDialog = new ConfirmationDialog();
+		_spawnConfirmDialog.Title = "Nieuw Punt Toevoegen";
+		_spawnConfirmDialog.DialogText = "Wil je een nieuw punt op deze positie toevoegen?";
+		_spawnConfirmDialog.OkButtonText = "Confirm";
+		_spawnConfirmDialog.CancelButtonText = "Cancel";
+		_spawnConfirmDialog.Size = new Vector2I(450, 200);
+		
+		// Connect signals
+		_spawnConfirmDialog.Confirmed += OnSpawnConfirmed;
+		_spawnConfirmDialog.Canceled += OnSpawnCanceled;
+		
+		// Voeg toe aan scene tree
+		AddChild(_spawnConfirmDialog);
+	}
+	
+	private void OnSpawnConfirmed()
+	{
+		GD.Print($"[EDIT MODE] ✓ Bevestigd: Spawn nieuw punt op positie {_pendingSpawnPosition} na index {_pendingInsertIndex}");
+		
+		// Save undo state
+		_pointPlacer.SaveEditUndoState();
+		
+		// Voeg nieuw punt toe aan de point placer
+		_pointPlacer.InsertPoint(_pendingInsertIndex + 1, _pendingSpawnPosition);
+		
+		// Rebuild visualisatie
+		_pointPlacer.RebuildFromCurrentData();
+		
+		// Refresh edit points
+		RefreshEditPoints();
+	}
+	
+	private void OnSpawnCanceled()
+	{
+		GD.Print("[EDIT MODE] ✗ Geannuleerd: Nieuw punt niet toegevoegd");
 	}
 
 	public void ToggleEditMode()
@@ -88,6 +138,9 @@ public partial class EditModeManager : Node3D
 			_editPointsParent.AddChild(editPoint);
 			_editablePoints.Add(editPoint);
 		}
+		
+		// Bouw lijn segmenten voor click detectie
+		BuildLineSegments();
 	}
 
 	private void ExitEditMode()
@@ -95,7 +148,57 @@ public partial class EditModeManager : Node3D
 		_isDragging = false;
 		_selectedPoint = null;
 		_hoveredPoint = null;
+		_lineSegments.Clear();
 		ClearEditPoints();
+	}
+	
+	private void BuildLineSegments()
+	{
+		_lineSegments.Clear();
+		
+		var csvPoints = _pointPlacer.GetPoints();
+		var cornerPoints = _pointPlacer.GetCornerPoints();
+		
+		if (csvPoints.Count < 2) return;
+		
+		// Bouw lijn segmenten gebaseerd op dezelfde logica als BuildLevelLines
+		// We moeten de verbindingen tussen CSV punten en corner punten reconstrueren
+		
+		int cornerIndex = 0;
+		float heightThreshold = 0.05f; // Zelfde als in BuildLevelLines
+		float maxGap = 4.0f; // MaxRowGap van CsvPointPlacer
+		
+		for (int i = 0; i < csvPoints.Count - 1; i++)
+		{
+			Vector3 a = csvPoints[i];
+			Vector3 b = csvPoints[i + 1];
+			
+			float dist3D = (b - a).Length();
+			float dist2D = new Vector2(b.X - a.X, b.Z - a.Z).Length();
+			float heightDiff = Mathf.Abs(b.Y - a.Y);
+			
+			// Skip als te ver weg
+			if (dist3D > maxGap) continue;
+			
+			// Check of er een corner point tussen zit
+			if (heightDiff > heightThreshold && dist2D > 0.05f && cornerIndex < cornerPoints.Count)
+			{
+				Vector3 cornerPoint = cornerPoints[cornerIndex];
+				
+				// Voeg twee segmenten toe: a -> corner en corner -> b
+				_lineSegments.Add((a, cornerPoint, i, -1)); // -1 betekent corner point
+				_lineSegments.Add((cornerPoint, b, -1, i + 1));
+				
+				cornerIndex++;
+			}
+			else
+			{
+				// Directe verbinding zonder corner point
+				_lineSegments.Add((a, b, i, i + 1));
+			}
+		}
+		
+		GD.Print($"[EDIT MODE] {_lineSegments.Count} line segments gebouwd voor click detectie (inclusief corners)");
 	}
 
 	private void ClearEditPoints()
@@ -173,6 +276,9 @@ public partial class EditModeManager : Node3D
 		}
 		
 		GD.Print($"[EDIT MODE] {csvPoints.Count} CSV points + {cornerPoints.Count} corner points refreshed");
+		
+		// Herbouw lijn segmenten
+		BuildLineSegments();
 	}
 
 	public override void _Process(double delta)
@@ -244,7 +350,7 @@ public partial class EditModeManager : Node3D
 	{
 		if (!IsEditMode) return;
 
-		// Linker muisklik: selecteer/start drag
+		// Linker muisklik: selecteer/start drag OF spawn nieuw punt op lijn
 		if (@event is InputEventMouseButton mb && mb.ButtonIndex == MouseButton.Left)
 		{
 			if (mb.Pressed)
@@ -285,6 +391,11 @@ public partial class EditModeManager : Node3D
 					{
 						_dragOffset = _selectedPoint.GlobalPosition - intersect.Value;
 					}
+				}
+				else
+				{
+					// Geen punt gehovered - check of we op een lijn klikken
+					TrySpawnPointOnLine();
 				}
 			}
 			else
@@ -348,5 +459,148 @@ public partial class EditModeManager : Node3D
 		
 		// Rebuild de mesh realtime
 		_pointPlacer.RebuildFromCurrentData();
+	}
+	
+	private void TrySpawnPointOnLine()
+	{
+		GD.Print("[EDIT MODE] TrySpawnPointOnLine aangeroepen");
+		
+		// Raycast naar de muispositie
+		var mousePos = GetViewport().GetMousePosition();
+		var from = _camera.ProjectRayOrigin(mousePos);
+		var rayDir = _camera.ProjectRayNormal(mousePos);
+		
+		GD.Print($"[EDIT MODE] Mouse pos: {mousePos}, Ray from: {from}, Ray dir: {rayDir}");
+		GD.Print($"[EDIT MODE] Checking {_lineSegments.Count} line segments");
+		
+		// Vind het dichtstbijzijnde punt op een lijn segment
+		Vector3? closestPointOnLine = null;
+		int insertAfterIndex = -1;
+		float closestDistance = float.MaxValue;
+		float maxClickDistance = 0.5f; // Verhoogd naar 50cm voor makkelijker testen
+		
+		for (int i = 0; i < _lineSegments.Count; i++)
+		{
+			var segment = _lineSegments[i];
+			
+			// Bereken het dichtstbijzijnde punt op dit lijn segment bij de ray
+			var closestOnSegment = ClosestPointOnLineSegmentToRay(segment.start, segment.end, from, rayDir);
+			
+			if (closestOnSegment.HasValue)
+			{
+				// Bereken de afstand van de ray tot dit punt
+				// We projecteren het punt op de ray en berekenen de loodrechte afstand
+				Vector3 toPoint = closestOnSegment.Value - from;
+				float projectionLength = toPoint.Dot(rayDir);
+				Vector3 projectionPoint = from + rayDir * projectionLength;
+				float dist = (closestOnSegment.Value - projectionPoint).Length();
+				
+				if (i < 3) // Debug eerste paar segmenten
+				{
+					GD.Print($"  Segment {i}: dist={dist:F3}m, closest={closestOnSegment.Value}");
+				}
+				
+				if (dist < closestDistance)
+				{
+					closestDistance = dist;
+					closestPointOnLine = closestOnSegment.Value;
+					// Als startIndex is -1, dan is dit een corner->csvpoint segment, gebruik endIndex - 1
+					// Anders gebruik startIndex
+					insertAfterIndex = segment.startIndex >= 0 ? segment.startIndex : segment.endIndex - 1;
+					
+					GD.Print($"  → Nieuwe beste: segment {i}, dist={dist:F3}m, insertAfter={insertAfterIndex}");
+				}
+			}
+		}
+		
+		GD.Print($"[EDIT MODE] Closest distance: {closestDistance:F3}m, threshold: {maxClickDistance:F3}m");
+		
+		// Als we een punt hebben gevonden binnen de threshold, toon confirmation dialog
+		if (closestPointOnLine.HasValue && closestDistance < maxClickDistance && insertAfterIndex >= 0)
+		{
+			GD.Print($"[EDIT MODE] Punt gevonden op positie {closestPointOnLine.Value} na index {insertAfterIndex}");
+			GD.Print($"[EDIT MODE] Toon confirmation dialog...");
+			
+			// Sla positie en index op voor later gebruik
+			_pendingSpawnPosition = closestPointOnLine.Value;
+			_pendingInsertIndex = insertAfterIndex;
+			
+			// Update dialog text met positie informatie
+			_spawnConfirmDialog.DialogText = $"Wil je een nieuw punt toevoegen?\n\n" +
+			                                  $"Positie: ({closestPointOnLine.Value.X:F2}, {closestPointOnLine.Value.Y:F2}, {closestPointOnLine.Value.Z:F2})\n" +
+			                                  $"Na punt index: {insertAfterIndex}";
+			
+			// Toon confirmation dialog
+			_spawnConfirmDialog.PopupCentered();
+		}
+		else
+		{
+			if (closestPointOnLine.HasValue && closestDistance >= maxClickDistance)
+			{
+				GD.Print($"[EDIT MODE] ✗ Punt te ver weg: {closestDistance:F3}m > {maxClickDistance:F3}m");
+			}
+			else if (closestPointOnLine.HasValue && insertAfterIndex < 0)
+			{
+				GD.Print($"[EDIT MODE] ✗ Ongeldig insertAfterIndex: {insertAfterIndex}");
+			}
+			else
+			{
+				GD.Print($"[EDIT MODE] ✗ Geen punt gevonden op lijn");
+			}
+		}
+	}
+	
+	private Vector3? ClosestPointOnLineSegmentToRay(Vector3 lineStart, Vector3 lineEnd, Vector3 rayOrigin, Vector3 rayDirection)
+	{
+		// Normaliseer ray direction
+		rayDirection = rayDirection.Normalized();
+		
+		// Check of segment geldig is
+		float lineLength = (lineEnd - lineStart).Length();
+		if (lineLength < 0.001f) return null; // Te kort segment
+		
+		// Vereenvoudigde methode: vind het punt op het lijn segment dat het dichtst bij de ray ligt
+		// We gebruiken een plane die loodrecht op de camera kijkrichting staat, door het lijn segment
+		
+		// Bereken het midden van het segment
+		Vector3 segmentMid = (lineStart + lineEnd) / 2f;
+		
+		// Maak een plane loodrecht op de ray direction, door het segment midden
+		Plane plane = new Plane(rayDirection, segmentMid);
+		
+		// Intersect ray met deze plane
+		var intersection = plane.IntersectsRay(rayOrigin, rayDirection);
+		
+		if (!intersection.HasValue)
+		{
+			// Als er geen intersectie is, probeer de plane door lineStart
+			plane = new Plane(rayDirection, lineStart);
+			intersection = plane.IntersectsRay(rayOrigin, rayDirection);
+			
+			if (!intersection.HasValue) return null;
+		}
+		
+		// Project het intersection punt op het lijn segment
+		Vector3 pointOnLine = ProjectPointOnLineSegment(intersection.Value, lineStart, lineEnd);
+		
+		return pointOnLine;
+	}
+	
+	private Vector3 ProjectPointOnLineSegment(Vector3 point, Vector3 lineStart, Vector3 lineEnd)
+	{
+		Vector3 lineDir = lineEnd - lineStart;
+		float lineLength = lineDir.Length();
+		
+		if (lineLength < 0.001f) return lineStart;
+		
+		lineDir /= lineLength; // Normalize
+		
+		// Project point op de lijn
+		float t = (point - lineStart).Dot(lineDir);
+		
+		// Clamp t to line segment
+		t = Mathf.Clamp(t, 0, lineLength);
+		
+		return lineStart + lineDir * t;
 	}
 }

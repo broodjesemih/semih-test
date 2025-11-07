@@ -100,7 +100,7 @@ undoRedoBox.AddChild(_redoButton);
 
 _autoCorrectButton = new Button();
 _autoCorrectButton.Name = "AutoCorrectButton";
-_autoCorrectButton.Text = "Auto Correct CSV";
+_autoCorrectButton.Text = "Smooth Stairpoints";
 _autoCorrectButton.CustomMinimumSize = new Vector2(200, 50);
 _autoCorrectButton.Pressed += OnAutoCorrectButtonPressed;
 vbox.AddChild(_autoCorrectButton);
@@ -176,11 +176,11 @@ GD.PrintErr("[UI] PointPlacer is NULL!");
 
 private void OnAutoCorrectButtonPressed()
 {
-GD.Print("[UI] Auto Correct button pressed!");
+GD.Print("[UI] Smooth button pressed!");
 if (_pointPlacer != null)
 {
 _pointPlacer.AutoCorrectCSV();
-_statusLabel.Text = "CSV Auto-gecorrigeerd";
+_statusLabel.Text = "CSV Smoothed";
 }
 else
 {
