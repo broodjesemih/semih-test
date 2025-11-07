@@ -43,9 +43,17 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 	[Export] public float LineRadius { get; set; } = 0.01f;        // "dikte" van de lijn (cilinder)
 	[Export] public Color LineColor { get; set; } = new Color(0, 1, 0);
 	
+	// Debug Mode - toggle groene vectoren
+	private bool _debugMode = false;
+	
 	// Gevulde treden
 	[Export] public bool DrawStairSteps { get; set; } = true;
 	[Export] public Color StepColor { get; set; } = new Color(0.8f, 0.8f, 0.8f, 0.7f); // Lichtgrijs, semi-transparant
+
+	// Auto-correct parameters
+	[Export] public float MergeDistanceThreshold { get; set; } = 0.05f;    // 5cm - punten dichterbij worden samengevoegd
+	[Export] public float ClusterMergeRadius { get; set; } = 0.15f;        // 15cm - radius voor cluster detectie
+	[Export] public float HeightSnapThreshold { get; set; } = 0.09f;       // 3cm - hoogte snappen naar niveau
 
 	private readonly CultureInfo _inv = CultureInfo.InvariantCulture;
 	private enum SegmentMode { RowsByY_SortX, ColsByX_SortY, ColsByZ_SortY }
@@ -54,6 +62,11 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 	private List<Vector3> _currentPoints = new List<Vector3>();
 	private List<Vector3> _currentCornerPoints = new List<Vector3>();
 	private EditModeManager _editModeManager;
+	
+	// Undo/Redo system
+	private List<(List<Vector3> points, List<Vector3> corners)> _undoStack = new List<(List<Vector3>, List<Vector3>)>();
+	private List<(List<Vector3> points, List<Vector3> corners)> _redoStack = new List<(List<Vector3>, List<Vector3>)>();
+	private const int MaxUndoSteps = 50; // Maximaal aantal undo's
 
 	public override void _Ready()
 	{
@@ -98,6 +111,12 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 		{
 			_currentCornerPoints[index] = newPosition;
 		}
+	}
+	
+	// Nieuwe methode: opslaan van undo state vanuit edit mode
+	public void SaveEditUndoState()
+	{
+		SaveUndoState();
 	}
 	
 	public void RebuildFromCurrentData()
@@ -156,6 +175,367 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 	public bool IsEditMode()
 	{
 		return _editModeManager != null && _editModeManager.IsEditMode;
+	}
+	
+	public void ToggleDebugMode()
+	{
+		_debugMode = !_debugMode;
+		GD.Print($"[DEBUG MODE] {(_debugMode ? "AAN" : "UIT")}");
+		
+		// Herbouw visualisatie om groene lijnen te tonen/verbergen
+		RebuildFromCurrentData();
+	}
+	
+	public bool IsDebugMode()
+	{
+		return _debugMode;
+	}
+	
+	// Undo/Redo systeem
+	private void SaveUndoState()
+	{
+		// Sla huidige staat op in undo stack (zowel points als corners)
+		var pointsCopy = new List<Vector3>(_currentPoints);
+		var cornersCopy = new List<Vector3>(_currentCornerPoints);
+		_undoStack.Add((pointsCopy, cornersCopy));
+		
+		// Limiteer stack grootte
+		if (_undoStack.Count > MaxUndoSteps)
+		{
+			_undoStack.RemoveAt(0);
+		}
+		
+		// Clear redo stack bij nieuwe actie
+		_redoStack.Clear();
+		
+		GD.Print($"[UNDO] State opgeslagen ({_undoStack.Count} states in stack)");
+	}
+	
+	public void Undo()
+	{
+		if (_undoStack.Count == 0)
+		{
+			GD.Print("[UNDO] Niets om te undo'en");
+			return;
+		}
+		
+		// Sla huidige staat op in redo stack
+		var currentPointsCopy = new List<Vector3>(_currentPoints);
+		var currentCornersCopy = new List<Vector3>(_currentCornerPoints);
+		_redoStack.Add((currentPointsCopy, currentCornersCopy));
+		
+		// Haal vorige staat terug
+		var previousState = _undoStack[_undoStack.Count - 1];
+		_undoStack.RemoveAt(_undoStack.Count - 1);
+		
+		_currentPoints = new List<Vector3>(previousState.points);
+		_currentCornerPoints = new List<Vector3>(previousState.corners);
+		
+		GD.Print($"[UNDO] State hersteld ({_undoStack.Count} undo's over)");
+		
+		// Rebuild visualisatie
+		RebuildFromCurrentData();
+		
+		// Refresh edit points als we in edit mode zijn
+		if (_editModeManager != null && IsEditMode())
+		{
+			_editModeManager.RefreshEditPoints();
+		}
+	}
+	
+	public void Redo()
+	{
+		if (_redoStack.Count == 0)
+		{
+			GD.Print("[REDO] Niets om te redo'en");
+			return;
+		}
+		
+		// Sla huidige staat op in undo stack
+		var currentPointsCopy = new List<Vector3>(_currentPoints);
+		var currentCornersCopy = new List<Vector3>(_currentCornerPoints);
+		_undoStack.Add((currentPointsCopy, currentCornersCopy));
+		
+		// Haal redo staat terug
+		var redoState = _redoStack[_redoStack.Count - 1];
+		_redoStack.RemoveAt(_redoStack.Count - 1);
+		
+		_currentPoints = new List<Vector3>(redoState.points);
+		_currentCornerPoints = new List<Vector3>(redoState.corners);
+		
+		GD.Print($"[REDO] State hersteld ({_redoStack.Count} redo's over)");
+		
+		// Rebuild visualisatie
+		RebuildFromCurrentData();
+		
+		// Refresh edit points als we in edit mode zijn
+		if (_editModeManager != null && IsEditMode())
+		{
+			_editModeManager.RefreshEditPoints();
+		}
+	}
+	
+	public bool CanUndo() => _undoStack.Count > 0;
+	public bool CanRedo() => _redoStack.Count > 0;
+	
+	public void AutoCorrectCSV()
+	{
+		if (_currentPoints == null || _currentPoints.Count == 0)
+		{
+			GD.PrintErr("[AUTO CORRECT] Geen punten om te corrigeren!");
+			return;
+		}
+		
+		// Save state before auto-correct
+		SaveUndoState();
+		
+		GD.Print($"[AUTO CORRECT] Start met {_currentPoints.Count} punten");
+		
+		var correctedPoints = new List<Vector3>(_currentPoints);
+		
+		// STAP 1A: Merge opeenvolgende punten die te dicht bij elkaar zitten (meetfouten)
+		// Dit is belangrijker omdat CSV punten in volgorde zijn gemeten
+		int sequentialMerged = 0;
+		for (int i = correctedPoints.Count - 1; i >= 1; i--)
+		{
+			float dist = (correctedPoints[i] - correctedPoints[i - 1]).Length();
+			
+			if (dist < MergeDistanceThreshold)
+			{
+				// Vervang beide punten door gemiddelde positie
+				Vector3 avgPos = (correctedPoints[i] + correctedPoints[i - 1]) * 0.5f;
+				correctedPoints[i - 1] = avgPos;
+				correctedPoints.RemoveAt(i);
+				sequentialMerged++;
+			}
+		}
+		
+		GD.Print($"[AUTO CORRECT] Stap 1A: {sequentialMerged} opeenvolgende punten samengevoegd");
+		
+		// STAP 1B: Merge alle overige punten die te dicht bij elkaar zitten
+		int globalMerged = 0;
+		for (int i = correctedPoints.Count - 1; i >= 1; i--)
+		{
+			for (int j = i - 1; j >= 0; j--)
+			{
+				float dist = (correctedPoints[i] - correctedPoints[j]).Length();
+				
+				if (dist < MergeDistanceThreshold)
+				{
+					// Vervang beide punten door gemiddelde positie
+					Vector3 avgPos = (correctedPoints[i] + correctedPoints[j]) * 0.5f;
+					correctedPoints[j] = avgPos;
+					correctedPoints.RemoveAt(i);
+					globalMerged++;
+					break;
+				}
+			}
+		}
+		
+		GD.Print($"[AUTO CORRECT] Stap 1B: {globalMerged} globale duplicaten samengevoegd");
+		int totalMerged = sequentialMerged + globalMerged;
+		GD.Print($"[AUTO CORRECT] Stap 1 totaal: {totalMerged} punten samengevoegd (was {_currentPoints.Count}, nu {correctedPoints.Count})");
+		
+		// STAP 1C: Cluster-based smoothing - vind clusters van punten en vervang door centrum
+		int clustersFound = 0;
+		int clustersSmoothed = 0;
+		bool changed = true;
+		
+		while (changed && correctedPoints.Count > 0)
+		{
+			changed = false;
+			var processed = new HashSet<int>();
+			
+			for (int i = 0; i < correctedPoints.Count; i++)
+			{
+				if (processed.Contains(i)) continue;
+				
+				// Vind alle punten binnen ClusterMergeRadius
+				var cluster = new List<int> { i };
+				processed.Add(i);
+				
+				for (int j = 0; j < correctedPoints.Count; j++)
+				{
+					if (i == j || processed.Contains(j)) continue;
+					
+					float dist = (correctedPoints[j] - correctedPoints[i]).Length();
+					if (dist <= ClusterMergeRadius)
+					{
+						cluster.Add(j);
+						processed.Add(j);
+					}
+				}
+				
+				// Als we een cluster vonden (2+ punten), vervang door gemiddelde
+				if (cluster.Count >= 2)
+				{
+					clustersFound++;
+					Vector3 center = Vector3.Zero;
+					foreach (int idx in cluster)
+					{
+						center += correctedPoints[idx];
+					}
+					center /= cluster.Count;
+					
+					// Verwijder alle punten in cluster (van achter naar voor)
+					cluster.Sort();
+					cluster.Reverse();
+					foreach (int idx in cluster)
+					{
+						correctedPoints.RemoveAt(idx);
+						clustersSmoothed++;
+					}
+					
+					// Voeg centrum toe
+					correctedPoints.Insert(cluster[cluster.Count - 1], center);
+					
+					changed = true;
+					break; // Herstart de loop
+				}
+			}
+		}
+		
+		GD.Print($"[AUTO CORRECT] Stap 1C: {clustersFound} clusters gevonden, {clustersSmoothed} punten vervangen door centrum (nu {correctedPoints.Count} punten)");
+		
+		// STAP 2: Snap hoogtes naar gemeenschappelijke niveaus
+		// Groepeer punten per hoogte-niveau
+		var heightGroups = new List<List<int>>();
+		var assigned = new bool[correctedPoints.Count];
+		
+		for (int i = 0; i < correctedPoints.Count; i++)
+		{
+			if (assigned[i]) continue;
+			
+			var group = new List<int> { i };
+			assigned[i] = true;
+			
+			for (int j = i + 1; j < correctedPoints.Count; j++)
+			{
+				if (assigned[j]) continue;
+				
+				float heightDiff = Mathf.Abs(correctedPoints[j].Y - correctedPoints[i].Y);
+				if (heightDiff <= HeightSnapThreshold)
+				{
+					group.Add(j);
+					assigned[j] = true;
+				}
+			}
+			
+			if (group.Count > 1)
+			{
+				heightGroups.Add(group);
+			}
+		}
+		
+		// Voor elke groep, bereken gemiddelde hoogte en pas toe
+		int snappedCount = 0;
+		foreach (var group in heightGroups)
+		{
+			float avgHeight = 0f;
+			foreach (int idx in group)
+			{
+				avgHeight += correctedPoints[idx].Y;
+			}
+			avgHeight /= group.Count;
+			
+			// Snap alle punten in de groep naar deze hoogte
+			foreach (int idx in group)
+			{
+				var pt = correctedPoints[idx];
+				correctedPoints[idx] = new Vector3(pt.X, avgHeight, pt.Z);
+				snappedCount++;
+			}
+		}
+		
+		GD.Print($"[AUTO CORRECT] Stap 2: {snappedCount} punten hoogte-gecorrigeerd in {heightGroups.Count} niveaus");
+		
+		// STAP 2B: Uniformeer hoogteverschillen tussen treden
+		if (heightGroups.Count >= 2)
+		{
+			// Sorteer groepen op hoogte
+			heightGroups.Sort((a, b) =>
+			{
+				float heightA = correctedPoints[a[0]].Y;
+				float heightB = correctedPoints[b[0]].Y;
+				return heightA.CompareTo(heightB);
+			});
+			
+			// Bereken alle hoogteverschillen tussen opeenvolgende treden
+			var heightDiffs = new List<float>();
+			for (int i = 0; i < heightGroups.Count - 1; i++)
+			{
+				float heightCurrent = correctedPoints[heightGroups[i][0]].Y;
+				float heightNext = correctedPoints[heightGroups[i + 1][0]].Y;
+				float diff = heightNext - heightCurrent;
+				if (diff > 0.01f) // Alleen echte treden (> 1cm verschil)
+				{
+					heightDiffs.Add(diff);
+				}
+			}
+			
+			if (heightDiffs.Count > 0)
+			{
+				// Bereken gemiddelde tredehoogte
+				float avgStepHeight = 0f;
+				foreach (float diff in heightDiffs)
+				{
+					avgStepHeight += diff;
+				}
+				avgStepHeight /= heightDiffs.Count;
+				
+				GD.Print($"[AUTO CORRECT] Stap 2B: Gemiddelde tredehoogte = {avgStepHeight:F3}m ({avgStepHeight * 100f:F1}cm)");
+				
+				// Herpositioneer alle treden met uniforme hoogteverschillen
+				// Behoud de hoogte van de eerste (laagste) trede als referentie
+				float baseHeight = correctedPoints[heightGroups[0][0]].Y;
+				
+				for (int i = 0; i < heightGroups.Count; i++)
+				{
+					float newHeight = baseHeight + (i * avgStepHeight);
+					
+					foreach (int idx in heightGroups[i])
+					{
+						var pt = correctedPoints[idx];
+						correctedPoints[idx] = new Vector3(pt.X, newHeight, pt.Z);
+					}
+					
+					if (i < 5) // Log eerste paar treden
+					{
+						GD.Print($"  Trede {i}: hoogte = {newHeight:F3}m");
+					}
+				}
+				
+				GD.Print($"[AUTO CORRECT] Stap 2B: {heightGroups.Count} treden geüniformeerd naar {avgStepHeight * 100f:F1}cm per trede");
+			}
+		}
+		
+		// STAP 3: Rond af op millimeters
+		for (int i = 0; i < correctedPoints.Count; i++)
+		{
+			var pt = correctedPoints[i];
+			correctedPoints[i] = new Vector3(
+				Mathf.Round(pt.X * 1000f) / 1000f,
+				Mathf.Round(pt.Y * 1000f) / 1000f,
+				Mathf.Round(pt.Z * 1000f) / 1000f
+			);
+		}
+		
+		GD.Print($"[AUTO CORRECT] Stap 3: Afgerond op millimeters");
+		GD.Print($"[AUTO CORRECT] Klaar! {_currentPoints.Count} → {correctedPoints.Count} punten");
+		
+		// Update de data en herbouw visualisatie
+		_currentPoints = correctedPoints;
+		ClearAllVisualizations();
+		BuildPoints(_currentPoints);
+		_currentCornerPoints = BuildLevelLines(_currentPoints);
+		BuildCornerPoints(_currentCornerPoints);
+		BuildStairSteps(_currentPoints, _currentCornerPoints);
+		
+		// Refresh edit points als we in edit mode zijn
+		if (_editModeManager != null && IsEditMode())
+		{
+			_editModeManager.RefreshEditPoints();
+		}
 	}
 
 	public override void _Process(double delta)
@@ -234,10 +614,10 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 		};
 
 		for (int i = 0; i < pts.Count; i++)
-		mm.SetInstanceTransform(i, new Transform3D(Basis.Identity, pts[i]));
+			mm.SetInstanceTransform(i, new Transform3D(Basis.Identity, pts[i]));
 
-	Multimesh = mm;
-}
+		Multimesh = mm;
+	}
 
 // ---------- CORNER POINTS ----------
 private void BuildCornerPoints(List<Vector3> cornerPoints)
@@ -303,7 +683,42 @@ private List<Vector3> BuildLevelLinesInternal(List<Vector3> pts, List<Vector3> p
 	var old = GetNodeOrNull<MultiMeshInstance3D>("LevelBars");
 	if (old != null) old.QueueFree();
 
-	if (!DrawLevelLines || pts.Count < 2) return new List<Vector3>();	var segments = new List<(Vector3 a, Vector3 b)>();
+	if (!DrawLevelLines || pts.Count < 2) return new List<Vector3>();
+	
+	// Als debug mode UIT is, teken geen groene lijnen maar sla wel corner points op
+	if (!_debugMode)
+	{
+		// Bereken corner points maar teken ze niet
+		var tempCornerPoints = predefinedCornerPoints ?? new List<Vector3>();
+		bool hasExistingCorners = (predefinedCornerPoints != null && predefinedCornerPoints.Count > 0);
+		
+		if (!hasExistingCorners)
+		{
+			// Bereken corner points voor trede-vulling
+			float heightThresh = 0.05f;
+			for (int i = 0; i < pts.Count - 1; i++)
+			{
+				Vector3 a = pts[i];
+				Vector3 b = pts[i + 1];
+				float dist3D = (b - a).Length();
+				float dist2D = new Vector2(b.X - a.X, b.Z - a.Z).Length();
+				float heightDiff = Mathf.Abs(b.Y - a.Y);
+				bool goingUp = b.Y > a.Y;
+				
+				if (dist3D <= MaxRowGap && heightDiff > heightThresh && dist2D > 0.05f)
+				{
+					Vector3 cornerPoint = goingUp 
+						? new Vector3(b.X, a.Y, b.Z)
+						: new Vector3(a.X, b.Y, a.Z);
+					tempCornerPoints.Add(cornerPoint);
+				}
+			}
+		}
+		
+		return tempCornerPoints;
+	}
+
+	var segments = new List<(Vector3 a, Vector3 b)>();
 
 	// ===== SEQUENTIËLE VERBINDINGSSTRATEGIE MET RECHTE HOEKEN =====
 	// De CSV punten zijn gemeten in volgorde: rechts omhoog, dan links omlaag

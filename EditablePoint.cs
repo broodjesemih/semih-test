@@ -7,7 +7,22 @@ public partial class EditablePoint : StaticBody3D
 {
 	public Vector3 OriginalPosition { get; set; }
 	public int PointIndex { get; set; }
-	public bool IsCornerPoint { get; set; }
+	
+	private bool _isCornerPoint = false;
+	public bool IsCornerPoint 
+	{ 
+		get => _isCornerPoint;
+		set
+		{
+			_isCornerPoint = value;
+			// Als de visual al bestaat, update de mesh
+			if (_visual != null)
+			{
+				UpdateMeshSize();
+				UpdateMaterials();
+			}
+		}
+	}
 	
 	private MeshInstance3D _visual;
 	private CollisionShape3D _collision;
@@ -25,12 +40,28 @@ public partial class EditablePoint : StaticBody3D
 		_collision.Shape = sphere;
 		AddChild(_collision);
 
-		// Visual mesh
+		// Visual mesh - verschillende groottes voor CSV vs Corner punten
 		_visual = new MeshInstance3D();
-		var mesh = new SphereMesh { Radius = 0.015f, Height = 0.035f };
-		_visual.Mesh = mesh;
+		UpdateMeshSize();
 		AddChild(_visual);
 
+		// Materials
+		UpdateMaterials();
+
+		_visual.MaterialOverride = _normalMaterial;
+	}
+	
+	private void UpdateMeshSize()
+	{
+		if (_visual == null) return;
+		
+		float visualRadius = IsCornerPoint ? 0.012f : 0.018f; // Corner kleiner, CSV groter
+		var mesh = new SphereMesh { Radius = visualRadius, Height = visualRadius * 2f };
+		_visual.Mesh = mesh;
+	}
+	
+	private void UpdateMaterials()
+	{
 		// Materials
 		_normalMaterial = new StandardMaterial3D 
 		{ 
@@ -49,8 +80,6 @@ public partial class EditablePoint : StaticBody3D
 			EmissionEnabled = true,
 			Emission = new Color(0, 1, 0)
 		};
-
-		_visual.MaterialOverride = _normalMaterial;
 	}
 
 	public void SetHovered(bool hovered)

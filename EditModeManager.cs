@@ -106,6 +106,74 @@ public partial class EditModeManager : Node3D
 		}
 		_editablePoints.Clear();
 	}
+	
+	// Public methode om edit points te refreshen na undo/redo
+	public void RefreshEditPoints()
+	{
+		if (!IsEditMode) return;
+		
+		GD.Print("[EDIT MODE] Refreshing edit points na undo/redo");
+		
+		// Bewaar selectie state
+		int? selectedIndex = null;
+		bool wasCorner = false;
+		if (_selectedPoint != null)
+		{
+			selectedIndex = _selectedPoint.PointIndex;
+			wasCorner = _selectedPoint.IsCornerPoint;
+		}
+		
+		// Verwijder oude punten
+		ClearEditPoints();
+		
+		// Maak nieuwe punten op de juiste posities
+		var csvPoints = _pointPlacer.GetPoints();
+		var cornerPoints = _pointPlacer.GetCornerPoints();
+		
+		// CSV punten
+		for (int i = 0; i < csvPoints.Count; i++)
+		{
+			var editPoint = new EditablePoint
+			{
+				OriginalPosition = csvPoints[i],
+				PointIndex = i,
+				IsCornerPoint = false,
+				Position = csvPoints[i]
+			};
+			_editPointsParent.AddChild(editPoint);
+			_editablePoints.Add(editPoint);
+			
+			// Herstel selectie
+			if (selectedIndex.HasValue && !wasCorner && i == selectedIndex.Value)
+			{
+				_selectedPoint = editPoint;
+				editPoint.SetSelected(true);
+			}
+		}
+		
+		// Corner punten
+		for (int i = 0; i < cornerPoints.Count; i++)
+		{
+			var editPoint = new EditablePoint
+			{
+				OriginalPosition = cornerPoints[i],
+				PointIndex = csvPoints.Count + i,
+				IsCornerPoint = true,
+				Position = cornerPoints[i]
+			};
+			_editPointsParent.AddChild(editPoint);
+			_editablePoints.Add(editPoint);
+			
+			// Herstel selectie
+			if (selectedIndex.HasValue && wasCorner && (csvPoints.Count + i) == selectedIndex.Value)
+			{
+				_selectedPoint = editPoint;
+				editPoint.SetSelected(true);
+			}
+		}
+		
+		GD.Print($"[EDIT MODE] {csvPoints.Count} CSV points + {cornerPoints.Count} corner points refreshed");
+	}
 
 	public override void _Process(double delta)
 	{
@@ -192,6 +260,10 @@ public partial class EditModeManager : Node3D
 					_selectedPoint = _hoveredPoint;
 					_selectedPoint.SetSelected(true);
 					_isDragging = true;
+					
+					// SAVE UNDO STATE voordat we beginnen met slepen
+					_pointPlacer.SaveEditUndoState();
+					GD.Print("[EDIT MODE] Undo state opgeslagen voor drag actie");
 
 					// Vind alle linked points (punten die op dezelfde hoogte zitten)
 					FindLinkedPoints(_selectedPoint);
