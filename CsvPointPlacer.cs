@@ -48,7 +48,15 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 	
 	// Gevulde treden
 	[Export] public bool DrawStairSteps { get; set; } = true;
-	[Export] public Color StepColor { get; set; } = new Color(0.8f, 0.8f, 0.8f, 0.7f); // Lichtgrijs, semi-transparant
+	[Export] public Color StepColor { get; set; } = new Color(1.5f, 1.5f, 1.5f); // Extra helder voor texture (werkt als brightness multiplier)
+	[Export] public bool UseWoodTexture { get; set; } = true; // Wood texture AAN
+	[Export] public bool UseFallbackColor { get; set; } = false; // Test mode uit - gebruik texture
+	[Export] public float MaterialBrightness { get; set; } = 1.5f; // Extra helderheid voor betere zichtbaarheid
+	[Export] public string WoodTexturePath { get; set; } = "res://data/textures/oak_veneer_01_diff_4k.jpg"; // Diffuse/Albedo texture
+	[Export] public string WoodNormalPath { get; set; } = ""; // Normal map (optioneel) - gebruik .png of .jpg, geen .exr
+	[Export] public string WoodRoughnessPath { get; set; } = ""; // Roughness map (optioneel) - gebruik .jpg, geen .exr
+	[Export] public string WoodAOPath { get; set; } = "res://data/textures/oak_veneer_01_ao_4k.jpg"; // Ambient Occlusion map
+	[Export] public float TextureScale { get; set; } = 0.5f; // Schaal van de texture (kleiner = meer detail)
 
 	// Auto-correct parameters
 	[Export] public float MergeDistanceThreshold { get; set; } = 0.05f;    // 5cm - punten dichterbij worden samengevoegd
@@ -1144,13 +1152,83 @@ private void BuildStairSteps(List<Vector3> pts, List<Vector3> cornerPoints)
 		var surfaceTool = new SurfaceTool();
 		surfaceTool.Begin(Mesh.PrimitiveType.Triangles);
 
-		// Materiaal
+		// Materiaal - met optionele wood texture
 		var material = new StandardMaterial3D
 		{
 			AlbedoColor = StepColor,
-			Transparency = BaseMaterial3D.TransparencyEnum.Alpha,
-			CullMode = BaseMaterial3D.CullModeEnum.Disabled // Beide kanten zichtbaar
+			Transparency = StepColor.A < 1.0f ? BaseMaterial3D.TransparencyEnum.Alpha : BaseMaterial3D.TransparencyEnum.Disabled,
+			CullMode = BaseMaterial3D.CullModeEnum.Disabled, // Beide kanten zichtbaar
+			ShadingMode = BaseMaterial3D.ShadingModeEnum.PerPixel,
+			DiffuseMode = BaseMaterial3D.DiffuseModeEnum.Burley,
+			SpecularMode = BaseMaterial3D.SpecularModeEnum.SchlickGgx,
+			// Lichte emissie voor betere zichtbaarheid (vooral in donkere scenes)
+			EmissionEnabled = !UseFallbackColor,
+			Emission = new Color(0.15f, 0.12f, 0.1f), // Warm subtiel licht
+			EmissionEnergyMultiplier = UseFallbackColor ? 2.0f : 0.3f
 		};
+		
+		// Laad wood texture (tenzij fallback mode aan staat voor testing)
+		if (!UseFallbackColor && UseWoodTexture && !string.IsNullOrEmpty(WoodTexturePath))
+		{
+			// Laad Albedo/Diffuse texture
+			if (ResourceLoader.Exists(WoodTexturePath))
+			{
+				var texture = ResourceLoader.Load<Texture2D>(WoodTexturePath);
+				if (texture != null)
+				{
+					material.AlbedoTexture = texture;
+					material.Uv1Scale = new Vector3(TextureScale, TextureScale, TextureScale);
+					
+					// CRITICAL: Zorg dat texture filtering goed staat
+					material.TextureFilter = BaseMaterial3D.TextureFilterEnum.LinearWithMipmaps;
+					
+					if (stepCount == 0)
+					{
+						GD.Print($"[TEXTURE] ✓ Wood diffuse geladen! Size: {texture.GetSize()}, Scale: {TextureScale}");
+					}
+				}
+				else
+				{
+					GD.PrintErr($"[TEXTURE] ✗ Kon texture niet laden: {WoodTexturePath}");
+				}
+			}
+			else
+			{
+				GD.PrintErr($"[TEXTURE] ✗ Bestand bestaat niet: {WoodTexturePath}");
+			}
+			
+			// Laad Normal map (optioneel)
+			if (!string.IsNullOrEmpty(WoodNormalPath) && ResourceLoader.Exists(WoodNormalPath))
+			{
+				var normalTex = ResourceLoader.Load<Texture2D>(WoodNormalPath);
+				if (normalTex != null)
+				{
+					material.NormalEnabled = true;
+					material.NormalTexture = normalTex;
+					GD.Print($"[TEXTURE] Normal map geladen: {WoodNormalPath}");
+				}
+			}
+			
+			// Laad Roughness map (optioneel)
+			if (!string.IsNullOrEmpty(WoodRoughnessPath) && ResourceLoader.Exists(WoodRoughnessPath))
+			{
+				var roughTex = ResourceLoader.Load<Texture2D>(WoodRoughnessPath);
+				if (roughTex != null)
+				{
+					material.RoughnessTexture = roughTex;
+					material.Roughness = 1.0f; // Texture bepaalt roughness
+					GD.Print($"[TEXTURE] Roughness map geladen: {WoodRoughnessPath}");
+				}
+			}
+			
+			// Laad Ambient Occlusion map (optioneel)
+			// Note: In Godot 4.5, AO wordt meestal via ORM texture geladen
+			// Voor nu gebruiken we het gewoon voor extra detail
+			if (!string.IsNullOrEmpty(WoodAOPath) && ResourceLoader.Exists(WoodAOPath))
+			{
+				GD.Print($"[TEXTURE] AO map beschikbaar: {WoodAOPath} (gebruik ORM voor betere resultaten)");
+			}
+		}
 
 		// Normale vector is altijd omhoog voor een horizontale trede
 		var normal = Vector3.Up;
@@ -1177,19 +1255,62 @@ private void BuildStairSteps(List<Vector3> pts, List<Vector3> cornerPoints)
 			return angleA.CompareTo(angleB);
 		});
 		
+		// Bereken bounding box voor betere UV mapping
+		float minX = float.MaxValue, maxX = float.MinValue;
+		float minZ = float.MaxValue, maxZ = float.MinValue;
+		
+		foreach (var p in sortedPoints)
+		{
+			if (p.X < minX) minX = p.X;
+			if (p.X > maxX) maxX = p.X;
+			if (p.Z < minZ) minZ = p.Z;
+			if (p.Z > maxZ) maxZ = p.Z;
+		}
+		
+		float sizeX = maxX - minX;
+		float sizeZ = maxZ - minZ;
+		if (sizeX < 0.001f) sizeX = 1f;
+		if (sizeZ < 0.001f) sizeZ = 1f;
+		
 		// Gebruik fan triangulatie vanaf het centrum
 		for (int i = 0; i < sortedPoints.Count; i++)
 		{
 			int nextI = (i + 1) % sortedPoints.Count;
 			
+			// UV coordinaten gebaseerd op werkelijke XZ positie
+			// Map naar [0,1] range binnen de bounding box
+			Vector2 uvCenter = new Vector2(
+				(center.X - minX) / sizeX, 
+				(center.Z - minZ) / sizeZ
+			);
+			Vector2 uvCurrent = new Vector2(
+				(sortedPoints[i].X - minX) / sizeX,
+				(sortedPoints[i].Z - minZ) / sizeZ
+			);
+			Vector2 uvNext = new Vector2(
+				(sortedPoints[nextI].X - minX) / sizeX,
+				(sortedPoints[nextI].Z - minZ) / sizeZ
+			);
+			
 			surfaceTool.SetNormal(normal);
+			surfaceTool.SetUV(uvCenter);
 			surfaceTool.AddVertex(center);
+			
+			surfaceTool.SetNormal(normal);
+			surfaceTool.SetUV(uvCurrent);
 			surfaceTool.AddVertex(sortedPoints[i]);
+			
+			surfaceTool.SetNormal(normal);
+			surfaceTool.SetUV(uvNext);
 			surfaceTool.AddVertex(sortedPoints[nextI]);
 		}
 
+		// Genereer normals voor lighting
+		surfaceTool.GenerateNormals();
+		
+		// Commit de mesh MET het material
+		surfaceTool.SetMaterial(material);
 		var mesh = surfaceTool.Commit();
-		mesh.SurfaceSetMaterial(0, material);
 
 		var meshInstance = new MeshInstance3D
 		{

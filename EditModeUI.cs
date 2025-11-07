@@ -14,7 +14,7 @@ private FileDialog _fileDialog;
 
 public override void _Ready()
 {
-// Haal knoppen en labels uit de scene (moeten in Godot editor aangemaakt zijn)
+// Probeer eerst bestaande nodes te vinden
 _editButton = GetNodeOrNull<Button>("VBoxContainer/EditButton");
 _debugButton = GetNodeOrNull<Button>("VBoxContainer/DebugButton");
 _undoButton = GetNodeOrNull<Button>("VBoxContainer/UndoButton");
@@ -23,29 +23,35 @@ _autoCorrectButton = GetNodeOrNull<Button>("VBoxContainer/AutoCorrectButton");
 _loadCsvButton = GetNodeOrNull<Button>("VBoxContainer/LoadCsvButton");
 _statusLabel = GetNodeOrNull<Label>("VBoxContainer/StatusLabel");
 
-// Fallback: als nodes niet bestaan, maak ze in code (backwards compatibility)
-if (_editButton == null || _debugButton == null || _undoButton == null || _redoButton == null || _autoCorrectButton == null || _loadCsvButton == null || _statusLabel == null)
+// Als nodes niet bestaan, maak ze dynamisch aan
+bool needsCreation = (_editButton == null || _debugButton == null || _undoButton == null || 
+					  _redoButton == null || _autoCorrectButton == null || 
+					  _loadCsvButton == null || _statusLabel == null);
+
+if (needsCreation)
 {
-GD.PrintErr("UI nodes niet gevonden in scene, maak ze dynamisch aan");
+GD.Print("[UI] UI nodes niet gevonden in scene, maak ze dynamisch aan");
 CreateUIInCode();
 }
-else
-{
-// Verbind signals van bestaande knoppen
-_editButton.Pressed += OnEditButtonPressed;
-_debugButton.Pressed += OnDebugButtonPressed;
-_undoButton.Pressed += OnUndoButtonPressed;
-_redoButton.Pressed += OnRedoButtonPressed;
-_autoCorrectButton.Pressed += OnAutoCorrectButtonPressed;
-_loadCsvButton.Pressed += OnLoadCsvButtonPressed;
-}
+
+// Verbind signals (werkt zowel voor bestaande als nieuwe nodes)
+if (_editButton != null) _editButton.Pressed += OnEditButtonPressed;
+if (_debugButton != null) _debugButton.Pressed += OnDebugButtonPressed;
+if (_undoButton != null) _undoButton.Pressed += OnUndoButtonPressed;
+if (_redoButton != null) _redoButton.Pressed += OnRedoButtonPressed;
+if (_autoCorrectButton != null) _autoCorrectButton.Pressed += OnAutoCorrectButtonPressed;
+if (_loadCsvButton != null) _loadCsvButton.Pressed += OnLoadCsvButtonPressed;
 
 // Vind de MultiMeshInstance3D in de scene tree
 // EditModeUI is onder CanvasLayer die onder Node3D zit
 _pointPlacer = GetNode<CsvPointPlacer>("../../MultiMeshInstance3D");
 if (_pointPlacer == null)
 {
-GD.PrintErr("CsvPointPlacer niet gevonden! Check de scene structuur.");
+GD.PrintErr("[UI] CsvPointPlacer niet gevonden! Check de scene structuur.");
+}
+else
+{
+GD.Print("[UI] CsvPointPlacer succesvol gevonden!");
 }
 
 // FileDialog aanmaken (kan niet visueel in scene vanwege popup)
