@@ -53,10 +53,12 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 	[Export] public bool UseFallbackColor { get; set; } = false; // Test mode uit - gebruik texture
 	[Export] public float MaterialBrightness { get; set; } = 1.5f; // Extra helderheid voor betere zichtbaarheid
 	[Export] public string WoodTexturePath { get; set; } = "res://data/textures/oak_veneer_01_diff_4k.jpg"; // Diffuse/Albedo texture
-	[Export] public string WoodNormalPath { get; set; } = ""; // Normal map (optioneel) - gebruik .png of .jpg, geen .exr
-	[Export] public string WoodRoughnessPath { get; set; } = ""; // Roughness map (optioneel) - gebruik .jpg, geen .exr
+	[Export] public string WoodNormalPath { get; set; } = "res://data/textures/oak_veneer_01_nor_gl_4k.exr"; // Normal map (EXR formaat)
+	[Export] public string WoodRoughnessPath { get; set; } = "res://data/textures/oak_veneer_01_rough_4k.exr"; // Roughness map (EXR formaat)
 	[Export] public string WoodAOPath { get; set; } = "res://data/textures/oak_veneer_01_ao_4k.jpg"; // Ambient Occlusion map
+	[Export] public string WoodDisplacementPath { get; set; } = "res://data/textures/oak_veneer_01_disp_4k.png"; // Displacement/Height map
 	[Export] public float TextureScale { get; set; } = 0.5f; // Schaal van de texture (kleiner = meer detail)
+	[Export] public float RoughnessAmount { get; set; } = 0.8f; // Roughness sterkte (0=glanzend, 1=mat)
 
 	// Auto-correct parameters
 	[Export] public float MergeDistanceThreshold { get; set; } = 0.05f;    // 5cm - punten dichterbij worden samengevoegd
@@ -1182,22 +1184,34 @@ private void BuildStairSteps(List<Vector3> pts, List<Vector3> cornerPoints)
 					// CRITICAL: Zorg dat texture filtering goed staat
 					material.TextureFilter = BaseMaterial3D.TextureFilterEnum.LinearWithMipmaps;
 					
+					// AlbedoColor wordt vermenigvuldigd met de texture kleur
+					// Gebruik een warme bruine tint voor houtkleur
+					material.AlbedoColor = new Color(0.6f, 0.6f, 0.45f, 1.0f); // Warme houtkleur
+					
+					// Verhoog emission voor betere zichtbaarheid
+					material.EmissionEnabled = true;
+					material.Emission = new Color(0.2f, 0.18f, 0.15f); // Warm subtiel licht
+					material.EmissionEnergyMultiplier = MaterialBrightness * 0.2f; // Gebruik brightness hier
+					
 					if (stepCount == 0)
 					{
-						GD.Print($"[TEXTURE] ✓ Wood diffuse geladen! Size: {texture.GetSize()}, Scale: {TextureScale}");
+						GD.Print($"[TEXTURE] ✓ Albedo geladen! Path: {WoodTexturePath}");
+						GD.Print($"[TEXTURE]   Size: {texture.GetSize()}, Scale: {TextureScale}");
+						GD.Print($"[TEXTURE]   AlbedoColor: Warme bruine houtkleur (RGB: 0.85, 0.7, 0.55)");
+						GD.Print($"[TEXTURE]   Emission brightness: {MaterialBrightness}");
 					}
 				}
 				else
 				{
-					GD.PrintErr($"[TEXTURE] ✗ Kon texture niet laden: {WoodTexturePath}");
+					GD.PrintErr($"[TEXTURE] ✗ Kon albedo texture niet laden: {WoodTexturePath}");
 				}
 			}
 			else
 			{
-				GD.PrintErr($"[TEXTURE] ✗ Bestand bestaat niet: {WoodTexturePath}");
+				GD.PrintErr($"[TEXTURE] ✗ Albedo bestand bestaat niet: {WoodTexturePath}");
 			}
 			
-			// Laad Normal map (optioneel)
+			// Laad Normal map (optioneel) - EXR formaat wordt ondersteund in Godot 4
 			if (!string.IsNullOrEmpty(WoodNormalPath) && ResourceLoader.Exists(WoodNormalPath))
 			{
 				var normalTex = ResourceLoader.Load<Texture2D>(WoodNormalPath);
@@ -1205,28 +1219,70 @@ private void BuildStairSteps(List<Vector3> pts, List<Vector3> cornerPoints)
 				{
 					material.NormalEnabled = true;
 					material.NormalTexture = normalTex;
-					GD.Print($"[TEXTURE] Normal map geladen: {WoodNormalPath}");
+					material.NormalScale = 1.0f; // Sterkte van normal map
+					if (stepCount == 0)
+					{
+						GD.Print($"[TEXTURE] ✓ Normal map geladen: {WoodNormalPath}");
+					}
+				}
+				else if (stepCount == 0)
+				{
+					GD.PrintErr($"[TEXTURE] ✗ Kon normal map niet laden: {WoodNormalPath}");
 				}
 			}
 			
-			// Laad Roughness map (optioneel)
+			// Laad Roughness map (optioneel) - EXR formaat
 			if (!string.IsNullOrEmpty(WoodRoughnessPath) && ResourceLoader.Exists(WoodRoughnessPath))
 			{
 				var roughTex = ResourceLoader.Load<Texture2D>(WoodRoughnessPath);
 				if (roughTex != null)
 				{
 					material.RoughnessTexture = roughTex;
-					material.Roughness = 1.0f; // Texture bepaalt roughness
-					GD.Print($"[TEXTURE] Roughness map geladen: {WoodRoughnessPath}");
+					material.Roughness = RoughnessAmount; // Basis roughness waarde
+					material.RoughnessTextureChannel = BaseMaterial3D.TextureChannel.Red; // EXR gebruikt vaak rood kanaal
+					if (stepCount == 0)
+					{
+						GD.Print($"[TEXTURE] ✓ Roughness map geladen: {WoodRoughnessPath} (amount: {RoughnessAmount})");
+					}
 				}
+				else if (stepCount == 0)
+				{
+					GD.PrintErr($"[TEXTURE] ✗ Kon roughness map niet laden: {WoodRoughnessPath}");
+				}
+			}
+			else if (stepCount == 0)
+			{
+				// Geen roughness texture, gebruik default waarde
+				material.Roughness = RoughnessAmount;
+				GD.Print($"[TEXTURE] Geen roughness map, gebruik default: {RoughnessAmount}");
 			}
 			
 			// Laad Ambient Occlusion map (optioneel)
-			// Note: In Godot 4.5, AO wordt meestal via ORM texture geladen
-			// Voor nu gebruiken we het gewoon voor extra detail
+			// In Godot 4, AO wordt gebruikt via ORM texture of scene lighting
+			// Voor nu: sla dit over, albedo + normal + roughness is voldoende
 			if (!string.IsNullOrEmpty(WoodAOPath) && ResourceLoader.Exists(WoodAOPath))
 			{
-				GD.Print($"[TEXTURE] AO map beschikbaar: {WoodAOPath} (gebruik ORM voor betere resultaten)");
+				if (stepCount == 0)
+				{
+					GD.Print($"[TEXTURE] ℹ AO map beschikbaar maar wordt niet gebruikt: {WoodAOPath}");
+					GD.Print($"[TEXTURE]   (In Godot 4, gebruik ORM texture voor gecombineerde AO/Roughness/Metallic)");
+				}
+			}
+			
+			// Laad Displacement/Height map (optioneel)
+			if (!string.IsNullOrEmpty(WoodDisplacementPath) && ResourceLoader.Exists(WoodDisplacementPath))
+			{
+				var dispTex = ResourceLoader.Load<Texture2D>(WoodDisplacementPath);
+				if (dispTex != null)
+				{
+					material.HeightmapEnabled = true;
+					material.HeightmapTexture = dispTex;
+					material.HeightmapScale = 0.05f; // Subtiele displacement
+					if (stepCount == 0)
+					{
+						GD.Print($"[TEXTURE] ✓ Heightmap geladen: {WoodDisplacementPath}");
+					}
+				}
 			}
 		}
 

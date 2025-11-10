@@ -1,8 +1,15 @@
-[gd_scene load_steps=4 format=3 uid="uid://noasxj55tu5w"]
+[gd_scene load_steps=5 format=3 uid="uid://noasxj55tu5w"]
 
 [ext_resource type="Script" uid="uid://cl3465ntnw852" path="res://CsvPointPlacer.cs" id="2_a0tk4"]
 [ext_resource type="Script" uid="uid://bcpq6f3jxaask" path="res://FreeFlyCam.cs" id="2_noarx"]
 [ext_resource type="Script" uid="uid://2v8h2sdwp357" path="res://EditModeUI.cs" id="3_edit"]
+
+[sub_resource type="Curve3D" id="Curve3D_a0tk4"]
+_data = {
+"points": PackedVector3Array(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, -1, 0, 0, 0, 0, 0, 0),
+"tilts": PackedFloat32Array(0, 0, 0)
+}
+point_count = 3
 
 [node name="Node3D" type="Node3D"]
 
@@ -19,9 +26,7 @@ light_energy = 8.052
 script = ExtResource("2_a0tk4")
 MaxRowGap = 25.0
 LevelEpsilon = 0.1
-StepColor = Color(0, 0, 0, 1)
-UseWoodTexture = true
-UseFallbackColor = false
+StepColor = Color(1, 1, 1, 1)
 
 [node name="CanvasLayer" type="CanvasLayer" parent="."]
 
@@ -35,3 +40,8 @@ grow_vertical = 2
 mouse_filter = 2
 script = ExtResource("3_edit")
 metadata/_edit_use_anchors_ = true
+
+[node name="Path3D" type="Path3D" parent="."]
+curve = SubResource("Curve3D_a0tk4")
+
+[node name="PathFollow3D" type="PathFollow3D" parent="Path3D"]
