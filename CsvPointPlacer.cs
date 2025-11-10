@@ -46,6 +46,7 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 	[Export] public bool DrawQuarterPoints { get; set; } = true;
 	[Export] public float QuarterPointSize { get; set; } = 0.012f;
 	[Export] public Color QuarterPointColor { get; set; } = new Color(1, 0, 0); // Rood
+	[Export] public float QuarterPointDistance { get; set; } = 0.135f; // 135mm offset vanaf rand/hoekpunt
 	
 	// Dimension labels (afmetingen op gele lijnen)
 	[Export] public bool DrawDimensionLabels { get; set; } = true;
@@ -56,6 +57,10 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 	[Export] public Color EditingLabelColor { get; set; } = new Color(0, 1, 0); // Groen tijdens bewerken
 	[Export] public float LabelOffset { get; set; } = 0.1f; // Afstand boven de lijn
 	[Export] public bool ShowInCentimeters { get; set; } = true; // cm of meters
+	
+	// Angle labels (hoek labels op corner points)
+	[Export] public bool DrawAngleLabels { get; set; } = true; // Toon hoeken op corners
+	[Export] public Color AngleLabelColor { get; set; } = new Color(1, 0.5f, 0); // Oranje
 
 	// lijnen per hoogtebucket (stuk van trede)
 	[Export] public bool DrawLevelLines { get; set; } = true;
@@ -98,6 +103,7 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 	// Dimension label data per trede
 	private Dictionary<int, List<(Vector3 a, Vector3 b)>> _segmentsPerStep = new Dictionary<int, List<(Vector3, Vector3)>>();
 	private Dictionary<int, Node3D> _labelNodesPerStep = new Dictionary<int, Node3D>();
+	private Dictionary<int, Node3D> _angleNodesPerStep = new Dictionary<int, Node3D>(); // Angle visualizations per trede
 	private int _selectedStepIndex = -1; // -1 = geen selectie
 	
 	// Label editing data
@@ -267,6 +273,15 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 					return;
 				}
 			}
+			
+			// Als we hier komen: er is geklikt maar geen trede of label geraakt
+			// Verberg de huidige selectie (wegklikken)
+			if (_selectedStepIndex != -1)
+			{
+				HideStepLabels(_selectedStepIndex);
+				_selectedStepIndex = -1;
+				GD.Print($"[CLICK] Wegklik gedetecteerd - alle labels verborgen");
+			}
 		}
 	}
 	
@@ -370,6 +385,9 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 			return;
 		}
 		
+		// Sla huidige staat op voordat we wijzigingen maken (voor undo)
+		SaveUndoState();
+		
 		// Haal segment data op
 		var (pointA, pointB, segmentIndex) = _labelToSegmentMap[_editingLabel];
 		float oldDistance = (pointB - pointA).Length();
@@ -382,6 +400,13 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 		
 		// Update de punten in _currentPoints
 		UpdateSegmentPoints(pointA, pointB, pointA, newPointB);
+		
+		// Verberg huidige selectie voordat we rebuilden
+		if (_selectedStepIndex != -1)
+		{
+			HideStepLabels(_selectedStepIndex);
+			_selectedStepIndex = -1;
+		}
 		
 		// Rebuild de visualisatie
 		RebuildFromCurrentData();
@@ -430,25 +455,40 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 	
 	private void ShowStepLabels(int stepIndex)
 	{
+		int totalShown = 0;
+		
+		// Toon dimension labels
 		if (_labelNodesPerStep.TryGetValue(stepIndex, out var labelNode))
 		{
 			labelNode.Visible = true;
-			int childCount = labelNode.GetChildCount();
-			GD.Print($"[SHOW LABELS] Toon {childCount} labels voor step {stepIndex}");
+			totalShown += labelNode.GetChildCount();
 		}
-		else
+		
+		// Toon angle labels
+		if (_angleNodesPerStep.TryGetValue(stepIndex, out var angleNode))
 		{
-			GD.Print($"[SHOW LABELS] Geen label node gevonden voor step {stepIndex}");
+			angleNode.Visible = true;
+			totalShown += angleNode.GetChildCount();
 		}
+		
+		GD.Print($"[SHOW LABELS] Toon {totalShown} labels (dimensies + hoeken) voor step {stepIndex}");
 	}
 	
 	private void HideStepLabels(int stepIndex)
 	{
+		// Verberg dimension labels
 		if (_labelNodesPerStep.TryGetValue(stepIndex, out var labelNode))
 		{
 			labelNode.Visible = false;
-			GD.Print($"[HIDE LABELS] Labels verborgen voor step {stepIndex}");
 		}
+		
+		// Verberg angle labels
+		if (_angleNodesPerStep.TryGetValue(stepIndex, out var angleNode))
+		{
+			angleNode.Visible = false;
+		}
+		
+		GD.Print($"[HIDE LABELS] Labels verborgen voor step {stepIndex}");
 	}
 	
 	// Public methods voor edit mode
@@ -1055,6 +1095,168 @@ private void BuildCornerPoints(List<Vector3> cornerPoints)
 	AddChild(cornerMmi);
 	
 	GD.Print($"[CORNER POINTS] {cornerPoints.Count} corner points getekend");
+	
+	// Bouw hoek labels en visualisaties
+	if (DrawAngleLabels)
+	{
+		BuildAngleLabelsAndVisualizations(cornerPoints);
+	}
+}
+
+// ---------- ANGLE LABELS & VISUALIZATIONS ----------
+private void BuildAngleLabelsAndVisualizations(List<Vector3> cornerPoints)
+{
+	// Verwijder oude angle visualizations
+	var oldAngles = GetNodeOrNull<Node3D>("AngleVisualizations");
+	if (oldAngles != null) oldAngles.QueueFree();
+	
+	_angleNodesPerStep.Clear();
+	
+	if (!DrawAngleLabels) return;
+	
+	var anglesParent = new Node3D { Name = "AngleVisualizations" };
+	AddChild(anglesParent);
+	
+	int totalAngles = 0;
+	
+	// Gebruik segment data om hoeken te vinden waar segmenten elkaar raken (per trede)
+	foreach (var stepKvp in _segmentsPerStep)
+	{
+		int stepIndex = stepKvp.Key;
+		var segments = stepKvp.Value;
+		
+		// Maak een node voor deze trede's hoeken (start onzichtbaar als ClickToShowDimensions aan staat)
+		var stepAnglesNode = new Node3D { Name = $"StepAngles_{stepIndex}" };
+		stepAnglesNode.Visible = !ClickToShowDimensions; // Alleen zichtbaar als click-to-show uit staat
+		anglesParent.AddChild(stepAnglesNode);
+		_angleNodesPerStep[stepIndex] = stepAnglesNode;
+		
+		int angleCountThisStep = 0;
+		
+		// Voor elk segment, zoek een ander segment dat een eindpunt deelt
+		for (int i = 0; i < segments.Count; i++)
+		{
+			var seg1 = segments[i];
+			
+			for (int j = i + 1; j < segments.Count; j++)
+			{
+				var seg2 = segments[j];
+				
+				// Check of de segmenten een punt delen
+				Vector3? sharedPoint = null;
+				Vector3 seg1Other = Vector3.Zero;
+				Vector3 seg2Other = Vector3.Zero;
+				
+				float epsilon = 0.001f;
+				
+				if ((seg1.a - seg2.a).Length() < epsilon)
+				{
+					sharedPoint = seg1.a;
+					seg1Other = seg1.b;
+					seg2Other = seg2.b;
+				}
+				else if ((seg1.a - seg2.b).Length() < epsilon)
+				{
+					sharedPoint = seg1.a;
+					seg1Other = seg1.b;
+					seg2Other = seg2.a;
+				}
+				else if ((seg1.b - seg2.a).Length() < epsilon)
+				{
+					sharedPoint = seg1.b;
+					seg1Other = seg1.a;
+					seg2Other = seg2.b;
+				}
+				else if ((seg1.b - seg2.b).Length() < epsilon)
+				{
+					sharedPoint = seg1.b;
+					seg1Other = seg1.a;
+					seg2Other = seg2.a;
+				}
+				
+				if (sharedPoint.HasValue)
+				{
+					Vector3 corner = sharedPoint.Value;
+					
+					// Bereken richtingen vanaf het gedeelde punt
+					Vector3 dirA = (seg1Other - corner).Normalized();
+					Vector3 dirB = (seg2Other - corner).Normalized();
+					
+					// Bereken hoek
+					float dotProduct = dirA.Dot(dirB);
+					float angleRadians = Mathf.Acos(Mathf.Clamp(dotProduct, -1f, 1f));
+					float angleDegrees = Mathf.RadToDeg(angleRadians);
+					
+					// Skip als hoek te klein (bijna parallel) of te groot (bijna 180°)
+					if (angleDegrees < 15f || angleDegrees > 165f) continue;
+					
+					// Maak hoek label (zonder boog visualisatie)
+					Vector3 labelDir = (dirA + dirB).Normalized();
+					if (labelDir.Length() < 0.01f) labelDir = Vector3.Up;
+					else labelDir = labelDir.Normalized();
+					
+					// Plaats label dichter bij het hoekpunt (0.03m offset)
+					Vector3 labelPosition = corner + labelDir * 0.03f + new Vector3(0, 0.02f, 0);
+					
+					var angleLabel = new Label3D
+					{
+						Name = $"AngleLabel_{totalAngles}",
+						Text = $"{angleDegrees:F1}°",
+						Position = labelPosition,
+						FontSize = (int)LabelFontSize,
+						Modulate = AngleLabelColor,
+						Billboard = BaseMaterial3D.BillboardModeEnum.Enabled,
+						NoDepthTest = true,
+						OutlineSize = 8,
+						OutlineModulate = new Color(0, 0, 0, 0.8f)
+					};
+					
+					stepAnglesNode.AddChild(angleLabel);
+					totalAngles++;
+					angleCountThisStep++;
+				}
+			}
+		}
+		
+		GD.Print($"[ANGLE LABELS] Trede {stepIndex}: {angleCountThisStep} hoeken");
+	}
+	
+	GD.Print($"[ANGLE LABELS] Totaal {totalAngles} hoek labels gemaakt op gedeelde segment punten");
+}
+
+private List<Vector3> FindNearbyPointsAtSameHeight(Vector3 referencePoint, List<Vector3> points, float maxDistance)
+{
+	var nearby = new List<(float dist, Vector3 point)>();
+	int sameHeightCount = 0;
+	int tooFarCount = 0;
+	
+	foreach (var p in points)
+	{
+		// Check of punten op ongeveer dezelfde hoogte zijn
+		float heightDiff = Mathf.Abs(p.Y - referencePoint.Y);
+		if (heightDiff > LevelEpsilon)
+		{
+			continue;
+		}
+		
+		sameHeightCount++;
+		float dist = (p - referencePoint).Length();
+		if (dist > 0.01f && dist <= maxDistance)
+		{
+			nearby.Add((dist, p));
+		}
+		else if (dist > maxDistance)
+		{
+			tooFarCount++;
+		}
+	}
+	
+	GD.Print($"  [NEARBY] Ref Y={referencePoint.Y:F3}, op zelfde hoogte: {sameHeightCount}, binnen afstand: {nearby.Count}, te ver: {tooFarCount}");
+	
+	// Sorteer op afstand
+	nearby.Sort((a, b) => a.dist.CompareTo(b.dist));
+	
+	return nearby.ConvertAll(x => x.point);
 }
 
 // ---------- MIDDLE POINTS ----------
@@ -1112,14 +1314,85 @@ private (List<Vector3> middlePoints, List<Vector3> quarterPoints) CalculateMiddl
 		Vector3 centerPoint = (firstPoint + lastPoint) * 0.5f;
 		middlePoints.Add(centerPoint);
 		
-		// Bereken de quarter points (tussen CSV punt en middelpunt)
-		Vector3 leftQuarterPoint = (firstPoint + centerPoint) * 0.5f;  // Links kwart
-		Vector3 rightQuarterPoint = (lastPoint + centerPoint) * 0.5f;  // Rechts kwart
+		// Bereken de quarter points op vaste afstand van de CSV punten
+		float quarterDistance = QuarterPointDistance; // Parameter (default 135mm)
+		Vector3 directionLeft = (lastPoint - firstPoint).Normalized(); // Richting van links naar rechts
+		Vector3 directionRight = (firstPoint - lastPoint).Normalized(); // Richting van rechts naar links
+		
+		Vector3 leftQuarterPoint = firstPoint + directionLeft * quarterDistance;  // offset vanaf links CSV punt
+		Vector3 rightQuarterPoint = lastPoint + directionRight * quarterDistance; // offset vanaf rechts CSV punt
 		quarterPoints.Add(leftQuarterPoint);
 		quarterPoints.Add(rightQuarterPoint);
 		
 		float distance = (lastPoint - firstPoint).Length();
 		GD.Print($"  Trede op Y={centerPoint.Y:F3}m: middelpunt + 2 quarter points tussen eerste (#{group[0].index}) en laatste (#{group[group.Count - 1].index}) punt, afstand={distance:F2}m");
+		
+		// NIEUW: Voeg quarter points toe bij geometrische corners (90° bochten in de gele lijnen)
+		// Deze corners zijn NIET de CSV punten, maar de berekende tussenpunten waar de trap een hoek maakt
+		if (group.Count >= 5 && _currentCornerPoints != null && _currentCornerPoints.Count > 0)
+		{
+			// Zoek corner points die bij deze trede horen (op dezelfde hoogte)
+			var treadCorners = new List<Vector3>();
+			float treadHeight = firstPoint.Y;
+			
+			foreach (var corner in _currentCornerPoints)
+			{
+				float heightDiff = Mathf.Abs(corner.Y - treadHeight);
+				if (heightDiff <= LevelEpsilon)
+				{
+					treadCorners.Add(corner);
+				}
+			}
+			
+			GD.Print($"    Gevonden {treadCorners.Count} geometrische corners op trede Y={treadHeight:F3}m");
+			
+			// Voor elke corner, bereken quarter points langs de twee zijden van de hoek
+			foreach (var corner in treadCorners)
+			{
+				// Vind de dichtstbijzijnde CSV punten aan beide kanten van deze corner
+				// We zoeken punten die horizontaal (X/Z) dichtbij de corner liggen
+				var nearbyCSV = new List<(Vector3 point, float dist)>();
+				foreach (var csvPoint in group)
+				{
+					float dist2D = new Vector2(csvPoint.point.X - corner.X, csvPoint.point.Z - corner.Z).Length();
+					if (dist2D < 1.5f) // Binnen 1.5m horizontale afstand
+					{
+						nearbyCSV.Add((csvPoint.point, dist2D));
+					}
+				}
+				
+				// Sorteer op afstand
+				nearbyCSV.Sort((a, b) => a.dist.CompareTo(b.dist));
+				
+				// We hebben minimaal 2 CSV punten nodig om de richting van de hoek te bepalen
+				if (nearbyCSV.Count >= 2)
+				{
+					var closest1 = nearbyCSV[0].point;
+					var closest2 = nearbyCSV[1].point;
+					
+					// Bereken richtingen vanaf corner naar beide CSV punten
+					Vector3 dir1 = (closest1 - corner).Normalized();
+					Vector3 dir2 = (closest2 - corner).Normalized();
+					
+					// Check de hoek tussen deze twee richtingen
+					float dotProduct = dir1.Dot(dir2);
+					float angleRadians = Mathf.Acos(Mathf.Clamp(dotProduct, -1f, 1f));
+					float angleDegrees = Mathf.RadToDeg(angleRadians);
+					
+					// Als het een ~90° hoek is (70-110°), voeg quarter points toe
+					if (angleDegrees >= 70f && angleDegrees <= 110f)
+					{
+						// Plaats quarter points op afstand van de corner in beide richtingen
+						Vector3 qp1 = corner + dir1 * quarterDistance;
+						Vector3 qp2 = corner + dir2 * quarterDistance;
+						quarterPoints.Add(qp1);
+						quarterPoints.Add(qp2);
+						
+						GD.Print($"      ✓ Quarter points toegevoegd bij corner ({corner.X:F2}, {corner.Y:F2}, {corner.Z:F2}), hoek={angleDegrees:F1}°");
+					}
+				}
+			}
+		}
 	}
 	
 	GD.Print($"[MIDDLE POINTS] Totaal {middlePoints.Count} middelpunten + {quarterPoints.Count} quarter points berekend");
@@ -1463,34 +1736,9 @@ GD.Print($"[RESULTAAT] Corner dwarsverbindingen: {cornerCrossConnections} lijnen
 		}
 	}
 	
-	// EXTRA: Verbind ALLE punten op dit niveau met elkaar (niet alleen eerste-laatste)
-	// Dit zorgt voor volledige horizontale dekking
-	if (group.Count >= 2)
-	{
-		for (int i = 0; i < group.Count; i++)
-		{
-			for (int j = i + 1; j < group.Count; j++)
-			{
-				var a = group[i];
-				var b = group[j];
-				
-				float d2D = new Vector2(b.point.X - a.point.X, b.point.Z - a.point.Z).Length();
-				
-				// Verbind als afstand tussen min en max ligt
-				if (d2D > 0.15f && d2D <= MaxRowGap)
-				{
-					// Check of deze lijn niet al bestaat (eerste-laatste is al toegevoegd)
-					bool isDuplicate = (i == 0 && j == group.Count - 1);
-					
-					if (!isDuplicate)
-					{
-						segments.Add((a.point, b.point));
-						crossConnections++;
-					}
-				}
-			}
-		}
-	}
+	// OPMERKING: Niet alle punten verbinden!
+	// Voor een trede moeten we ALLEEN de rand-punten (linker en rechter) verbinden
+	// Dit voorkomt diagonale lijnen over het midden van grote treden
 }
 GD.Print($"[RESULTAAT] Dwarsverbindingen: {crossConnections} lijnen toegevoegd");
 GD.Print($"[TOTAAL] {segments.Count} segmenten voor rendering");
