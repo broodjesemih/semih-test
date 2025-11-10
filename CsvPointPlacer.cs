@@ -36,6 +36,26 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 	[Export] public bool DrawCornerPoints { get; set; } = true;
 	[Export] public float CornerPointSize { get; set; } = 0.01f;
 	[Export] public Color CornerPointColor { get; set; } = new Color(1, 1, 1); // Wit
+	
+	// Middle points (middelpunten tussen CSV nodes op elke trede)
+	[Export] public bool DrawMiddlePoints { get; set; } = true;
+	[Export] public float MiddlePointSize { get; set; } = 0.015f;
+	[Export] public Color MiddlePointColor { get; set; } = new Color(1, 0.5f, 0); // Oranje
+	
+	// Quarter points (kwart punten - tussen CSV punt en midden punt)
+	[Export] public bool DrawQuarterPoints { get; set; } = true;
+	[Export] public float QuarterPointSize { get; set; } = 0.012f;
+	[Export] public Color QuarterPointColor { get; set; } = new Color(1, 0, 0); // Rood
+	
+	// Dimension labels (afmetingen op gele lijnen)
+	[Export] public bool DrawDimensionLabels { get; set; } = true;
+	[Export] public bool ClickToShowDimensions { get; set; } = true; // Klik op trede om afmetingen te tonen
+	[Export] public bool ClickToEditDimensions { get; set; } = true; // Klik op label om afmeting te bewerken
+	[Export] public float LabelFontSize { get; set; } = 8;
+	[Export] public Color LabelColor { get; set; } = new Color(1, 1, 0); // Geel
+	[Export] public Color EditingLabelColor { get; set; } = new Color(0, 1, 0); // Groen tijdens bewerken
+	[Export] public float LabelOffset { get; set; } = 0.1f; // Afstand boven de lijn
+	[Export] public bool ShowInCentimeters { get; set; } = true; // cm of meters
 
 	// lijnen per hoogtebucket (stuk van trede)
 	[Export] public bool DrawLevelLines { get; set; } = true;
@@ -71,7 +91,20 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 	// Edit mode data
 	private List<Vector3> _currentPoints = new List<Vector3>();
 	private List<Vector3> _currentCornerPoints = new List<Vector3>();
+	private List<Vector3> _currentMiddlePoints = new List<Vector3>();
+	private List<Vector3> _currentQuarterPoints = new List<Vector3>();
 	private EditModeManager _editModeManager;
+	
+	// Dimension label data per trede
+	private Dictionary<int, List<(Vector3 a, Vector3 b)>> _segmentsPerStep = new Dictionary<int, List<(Vector3, Vector3)>>();
+	private Dictionary<int, Node3D> _labelNodesPerStep = new Dictionary<int, Node3D>();
+	private int _selectedStepIndex = -1; // -1 = geen selectie
+	
+	// Label editing data
+	private Dictionary<Label3D, (Vector3 pointA, Vector3 pointB, int segmentIndex)> _labelToSegmentMap = new Dictionary<Label3D, (Vector3, Vector3, int)>();
+	private Label3D _editingLabel = null;
+	private string _editingText = "";
+	private bool _isEditingDimension = false;
 	
 	// Undo/Redo system
 	private List<(List<Vector3> points, List<Vector3> corners)> _undoStack = new List<(List<Vector3>, List<Vector3>)>();
@@ -100,6 +133,321 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 			_editModeManager = new EditModeManager();
 			AddChild(_editModeManager);
 			GD.Print("[CsvPointPlacer] EditModeManager aangemaakt");
+		}
+	}
+	
+	// Klik-detectie voor dimension labels en editing
+	public override void _UnhandledInput(InputEvent @event)
+	{
+		// Alleen in game mode
+		if (Engine.IsEditorHint()) return;
+		
+		// Handle keyboard input voor dimension editing
+		if (_isEditingDimension && @event is InputEventKey keyEvent && keyEvent.Pressed)
+		{
+			if (keyEvent.Keycode == Key.Enter || keyEvent.Keycode == Key.KpEnter)
+			{
+				// Bevestig de nieuwe waarde
+				ApplyDimensionEdit();
+				GetViewport().SetInputAsHandled();
+				return;
+			}
+			else if (keyEvent.Keycode == Key.Escape)
+			{
+				// Annuleer editing
+				CancelDimensionEdit();
+				GetViewport().SetInputAsHandled();
+				return;
+			}
+			else if (keyEvent.Keycode == Key.Backspace)
+			{
+				if (_editingText.Length > 0)
+				{
+					_editingText = _editingText.Substring(0, _editingText.Length - 1);
+					UpdateEditingLabel();
+				}
+				GetViewport().SetInputAsHandled();
+				return;
+			}
+			else if (keyEvent.Unicode != 0)
+			{
+				char c = (char)keyEvent.Unicode;
+				// Alleen cijfers, punt en komma toestaan
+				if (char.IsDigit(c) || c == '.' || c == ',')
+				{
+					_editingText += c;
+					UpdateEditingLabel();
+					GetViewport().SetInputAsHandled();
+					return;
+				}
+			}
+		}
+		
+		if (!ClickToShowDimensions) return;
+		
+		if (@event is InputEventMouseButton mouseButton && mouseButton.Pressed && mouseButton.ButtonIndex == MouseButton.Left)
+		{
+			var camera = GetViewport().GetCamera3D();
+			if (camera == null) return;
+			
+			var from = camera.ProjectRayOrigin(mouseButton.Position);
+			var to = from + camera.ProjectRayNormal(mouseButton.Position) * 1000f;
+			
+			var spaceState = GetWorld3D().DirectSpaceState;
+			var query = PhysicsRayQueryParameters3D.Create(from, to);
+			var result = spaceState.IntersectRay(query);
+			
+			if (result.Count > 0)
+			{
+				var collider = result["collider"].As<Node3D>();
+				GD.Print($"[CLICK DEBUG] Collider geraakt: {collider?.Name ?? "null"}");
+				
+				// Check of we een step collider hebben geraakt
+				if (collider != null && collider.HasMeta("step_y"))
+				{
+					float clickedStepY = (float)collider.GetMeta("step_y");
+					GD.Print($"[CLICK DEBUG] Step geraakt op Y={clickedStepY:F3}m, segmentsPerStep count: {_segmentsPerStep.Count}");
+					
+					// Vind de juiste segment groep op basis van Y-waarde
+					int matchingStepIndex = -1;
+					foreach (var kvp in _segmentsPerStep)
+					{
+						var firstSeg = kvp.Value[0];
+						float segmentY = (firstSeg.a.Y + firstSeg.b.Y) * 0.5f;
+						
+						// Check of de Y-waarden overeenkomen (binnen LevelEpsilon)
+						if (Mathf.Abs(clickedStepY - segmentY) <= LevelEpsilon)
+						{
+							matchingStepIndex = kvp.Key;
+							break;
+						}
+					}
+					
+					if (matchingStepIndex != -1)
+					{
+						// Toggle: als we dezelfde trede klikken, verberg labels
+						if (_selectedStepIndex == matchingStepIndex)
+						{
+							HideStepLabels(matchingStepIndex);
+							_selectedStepIndex = -1;
+							GD.Print($"[CLICK] Labels verborgen voor trede op Y={clickedStepY:F3}m");
+						}
+						else
+						{
+							// Verberg oude selectie
+							if (_selectedStepIndex != -1)
+							{
+								HideStepLabels(_selectedStepIndex);
+							}
+							
+							// Toon nieuwe selectie
+							ShowStepLabels(matchingStepIndex);
+							_selectedStepIndex = matchingStepIndex;
+							GD.Print($"[CLICK] Labels getoond voor trede op Y={clickedStepY:F3}m (index {matchingStepIndex})");
+						}
+					}
+					else
+					{
+						GD.Print($"[CLICK] Geen overeenkomende segment groep gevonden voor Y={clickedStepY:F3}m");
+					}
+					return; // Trede geraakt, check niet verder voor labels
+				}
+			}
+			
+			// Check of we een label hebben geklikt (alleen als ClickToEditDimensions aan staat)
+			if (ClickToEditDimensions && !_isEditingDimension)
+			{
+				// Probeer label te vinden op basis van screenspace positie
+				Label3D clickedLabel = FindLabelAtScreenPosition(mouseButton.Position);
+				
+				if (clickedLabel != null && _labelToSegmentMap.ContainsKey(clickedLabel))
+				{
+					StartEditingDimension(clickedLabel);
+					GetViewport().SetInputAsHandled();
+					return;
+				}
+			}
+		}
+	}
+	
+	private Label3D FindLabelAtScreenPosition(Vector2 screenPos)
+	{
+		var camera = GetViewport().GetCamera3D();
+		if (camera == null) return null;
+		
+		float minDistance = 30f; // pixels
+		Label3D closestLabel = null;
+		
+		// Check alle zichtbare labels
+		foreach (var kvp in _labelToSegmentMap)
+		{
+			var label = kvp.Key;
+			if (!label.Visible || !label.IsInsideTree()) continue;
+			
+			// Check of het parent node zichtbaar is
+			var parent = label.GetParent();
+			if (parent is Node3D parent3D && !parent3D.Visible) continue;
+			
+			// Project label positie naar screen space
+			Vector3 labelPos3D = label.GlobalPosition;
+			Vector2 labelScreenPos = camera.UnprojectPosition(labelPos3D);
+			
+			float distance = screenPos.DistanceTo(labelScreenPos);
+			if (distance < minDistance)
+			{
+				minDistance = distance;
+				closestLabel = label;
+			}
+		}
+		
+		return closestLabel;
+	}
+	
+	private void StartEditingDimension(Label3D label)
+	{
+		if (!_labelToSegmentMap.ContainsKey(label)) return;
+		
+		_editingLabel = label;
+		_isEditingDimension = true;
+		_editingText = "";
+		
+		// Verander label kleur naar groen
+		label.Modulate = EditingLabelColor;
+		label.Text = "_"; // Cursor
+		
+		GD.Print("[EDIT] Klik op label - Type nieuwe waarde en druk Enter (Esc = annuleren)");
+	}
+	
+	private void UpdateEditingLabel()
+	{
+		if (_editingLabel == null) return;
+		
+		_editingLabel.Text = _editingText + "_";
+	}
+	
+	private void CancelDimensionEdit()
+	{
+		if (_editingLabel == null) return;
+		
+		// Herstel originele label
+		var (pointA, pointB, _) = _labelToSegmentMap[_editingLabel];
+		float distance = (pointB - pointA).Length();
+		
+		string distanceText = ShowInCentimeters 
+			? $"{(distance * 100f):F1} cm" 
+			: $"{distance:F3} m";
+		
+		_editingLabel.Text = distanceText;
+		_editingLabel.Modulate = LabelColor;
+		
+		_editingLabel = null;
+		_isEditingDimension = false;
+		_editingText = "";
+		
+		GD.Print("[EDIT] Bewerking geannuleerd");
+	}
+	
+	private void ApplyDimensionEdit()
+	{
+		if (_editingLabel == null || string.IsNullOrEmpty(_editingText)) return;
+		
+		// Parse de nieuwe waarde
+		string text = _editingText.Replace(",", ".");
+		if (!float.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float newValue))
+		{
+			GD.PrintErr($"[EDIT] Ongeldige waarde: {_editingText}");
+			CancelDimensionEdit();
+			return;
+		}
+		
+		// Converteer naar meters als nodig
+		float newDistanceMeters = ShowInCentimeters ? (newValue / 100f) : newValue;
+		
+		if (newDistanceMeters <= 0.01f || newDistanceMeters > 10f)
+		{
+			GD.PrintErr($"[EDIT] Waarde buiten bereik: {newDistanceMeters}m (moet tussen 0.01 en 10 meter zijn)");
+			CancelDimensionEdit();
+			return;
+		}
+		
+		// Haal segment data op
+		var (pointA, pointB, segmentIndex) = _labelToSegmentMap[_editingLabel];
+		float oldDistance = (pointB - pointA).Length();
+		
+		GD.Print($"[EDIT] Pas afstand aan van {oldDistance:F3}m naar {newDistanceMeters:F3}m");
+		
+		// Bereken nieuwe punt posities
+		Vector3 direction = (pointB - pointA).Normalized();
+		Vector3 newPointB = pointA + direction * newDistanceMeters;
+		
+		// Update de punten in _currentPoints
+		UpdateSegmentPoints(pointA, pointB, pointA, newPointB);
+		
+		// Rebuild de visualisatie
+		RebuildFromCurrentData();
+		
+		_editingLabel = null;
+		_isEditingDimension = false;
+		_editingText = "";
+		
+		GD.Print("[EDIT] Afmeting toegepast en trap opnieuw gebouwd");
+	}
+	
+	private void UpdateSegmentPoints(Vector3 oldPointA, Vector3 oldPointB, Vector3 newPointA, Vector3 newPointB)
+	{
+		// Vind en update de punten in _currentPoints die overeenkomen met het segment
+		float epsilon = 0.001f;
+		
+		for (int i = 0; i < _currentPoints.Count; i++)
+		{
+			// Check of dit punt overeenkomt met pointA
+			if ((_currentPoints[i] - oldPointA).Length() < epsilon)
+			{
+				_currentPoints[i] = newPointA;
+				GD.Print($"  Update punt {i}: {oldPointA} -> {newPointA}");
+			}
+			// Check of dit punt overeenkomt met pointB
+			else if ((_currentPoints[i] - oldPointB).Length() < epsilon)
+			{
+				_currentPoints[i] = newPointB;
+				GD.Print($"  Update punt {i}: {oldPointB} -> {newPointB}");
+			}
+		}
+		
+		// Update ook corner points indien nodig
+		for (int i = 0; i < _currentCornerPoints.Count; i++)
+		{
+			if ((_currentCornerPoints[i] - oldPointA).Length() < epsilon)
+			{
+				_currentCornerPoints[i] = newPointA;
+			}
+			else if ((_currentCornerPoints[i] - oldPointB).Length() < epsilon)
+			{
+				_currentCornerPoints[i] = newPointB;
+			}
+		}
+	}
+	
+	private void ShowStepLabels(int stepIndex)
+	{
+		if (_labelNodesPerStep.TryGetValue(stepIndex, out var labelNode))
+		{
+			labelNode.Visible = true;
+			int childCount = labelNode.GetChildCount();
+			GD.Print($"[SHOW LABELS] Toon {childCount} labels voor step {stepIndex}");
+		}
+		else
+		{
+			GD.Print($"[SHOW LABELS] Geen label node gevonden voor step {stepIndex}");
+		}
+	}
+	
+	private void HideStepLabels(int stepIndex)
+	{
+		if (_labelNodesPerStep.TryGetValue(stepIndex, out var labelNode))
+		{
+			labelNode.Visible = false;
+			GD.Print($"[HIDE LABELS] Labels verborgen voor step {stepIndex}");
 		}
 	}
 	
@@ -147,6 +495,9 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 		BuildPoints(_currentPoints);
 		BuildLevelLinesFromData(_currentPoints, _currentCornerPoints);
 		BuildCornerPoints(_currentCornerPoints);
+		(_currentMiddlePoints, _currentQuarterPoints) = CalculateMiddleAndQuarterPoints(_currentPoints);
+		BuildMiddlePoints(_currentMiddlePoints);
+		BuildQuarterPoints(_currentQuarterPoints);
 		BuildStairSteps(_currentPoints, _currentCornerPoints);
 	}
 	
@@ -166,6 +517,30 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 		{
 			RemoveChild(oldCorners);
 			oldCorners.Free();
+		}
+		
+		// Verwijder oude middle points
+		var oldMiddle = GetNodeOrNull<MultiMeshInstance3D>("MiddlePoints");
+		if (oldMiddle != null)
+		{
+			RemoveChild(oldMiddle);
+			oldMiddle.Free();
+		}
+		
+		// Verwijder oude quarter points
+		var oldQuarter = GetNodeOrNull<MultiMeshInstance3D>("QuarterPoints");
+		if (oldQuarter != null)
+		{
+			RemoveChild(oldQuarter);
+			oldQuarter.Free();
+		}
+		
+		// Verwijder oude dimension labels
+		var oldLabels = GetNodeOrNull<Node3D>("DimensionLabels");
+		if (oldLabels != null)
+		{
+			RemoveChild(oldLabels);
+			oldLabels.Free();
 		}
 		
 		// Verwijder oude stair steps
@@ -589,6 +964,9 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 		BuildPoints(_currentPoints);
 		_currentCornerPoints = BuildLevelLines(_currentPoints);
 		BuildCornerPoints(_currentCornerPoints);
+		(_currentMiddlePoints, _currentQuarterPoints) = CalculateMiddleAndQuarterPoints(_currentPoints);
+		BuildMiddlePoints(_currentMiddlePoints);
+		BuildQuarterPoints(_currentQuarterPoints);
 		BuildStairSteps(_currentPoints, _currentCornerPoints);
 	}
 
@@ -611,6 +989,9 @@ public partial class CsvPointPlacer : MultiMeshInstance3D
 		BuildPoints(_currentPoints);
 		_currentCornerPoints = BuildLevelLines(_currentPoints);
 		BuildCornerPoints(_currentCornerPoints);
+		(_currentMiddlePoints, _currentQuarterPoints) = CalculateMiddleAndQuarterPoints(_currentPoints);
+		BuildMiddlePoints(_currentMiddlePoints);
+		BuildQuarterPoints(_currentQuarterPoints);
 		BuildStairSteps(_currentPoints, _currentCornerPoints);
 		
 		GD.Print($"CSV geladen: {pts.Count} punten");
@@ -674,6 +1055,148 @@ private void BuildCornerPoints(List<Vector3> cornerPoints)
 	AddChild(cornerMmi);
 	
 	GD.Print($"[CORNER POINTS] {cornerPoints.Count} corner points getekend");
+}
+
+// ---------- MIDDLE POINTS ----------
+private (List<Vector3> middlePoints, List<Vector3> quarterPoints) CalculateMiddleAndQuarterPoints(List<Vector3> pts)
+{
+	var middlePoints = new List<Vector3>();
+	var quarterPoints = new List<Vector3>();
+	
+	if (pts.Count < 2) return (middlePoints, quarterPoints);
+	
+	// Groepeer punten per hoogte niveau (per trede)
+	var heightGroups = new List<List<(int index, Vector3 point)>>();
+	var usedPoints = new bool[pts.Count];
+	
+	for (int i = 0; i < pts.Count; i++)
+	{
+		if (usedPoints[i]) continue;
+		
+		var group = new List<(int, Vector3)> { (i, pts[i]) };
+		usedPoints[i] = true;
+		
+		for (int j = i + 1; j < pts.Count; j++)
+		{
+			if (usedPoints[j]) continue;
+			
+			float heightDiff = Mathf.Abs(pts[j].Y - pts[i].Y);
+			if (heightDiff <= LevelEpsilon)
+			{
+				group.Add((j, pts[j]));
+				usedPoints[j] = true;
+			}
+		}
+		
+		if (group.Count >= 2) // Minimaal 2 punten nodig voor een middelpunt
+		{
+			heightGroups.Add(group);
+		}
+	}
+	
+	GD.Print($"[MIDDLE POINTS] Gevonden {heightGroups.Count} hoogte-niveaus voor middelpunten");
+	
+	// Voor elke trede, vind de twee uiterste punten (links en rechts) en bereken het middelpunt
+	foreach (var group in heightGroups)
+	{
+		if (group.Count < 2) continue;
+		
+		// Sorteer punten op CSV index (volgorde van meten)
+		group.Sort((a, b) => a.index.CompareTo(b.index));
+		
+		// Neem het EERSTE en LAATSTE punt (de uitersten van de gele lijn)
+		var firstPoint = group[0].point;
+		var lastPoint = group[group.Count - 1].point;
+		
+		// Bereken het middelpunt tussen deze twee uiterste punten
+		Vector3 centerPoint = (firstPoint + lastPoint) * 0.5f;
+		middlePoints.Add(centerPoint);
+		
+		// Bereken de quarter points (tussen CSV punt en middelpunt)
+		Vector3 leftQuarterPoint = (firstPoint + centerPoint) * 0.5f;  // Links kwart
+		Vector3 rightQuarterPoint = (lastPoint + centerPoint) * 0.5f;  // Rechts kwart
+		quarterPoints.Add(leftQuarterPoint);
+		quarterPoints.Add(rightQuarterPoint);
+		
+		float distance = (lastPoint - firstPoint).Length();
+		GD.Print($"  Trede op Y={centerPoint.Y:F3}m: middelpunt + 2 quarter points tussen eerste (#{group[0].index}) en laatste (#{group[group.Count - 1].index}) punt, afstand={distance:F2}m");
+	}
+	
+	GD.Print($"[MIDDLE POINTS] Totaal {middlePoints.Count} middelpunten + {quarterPoints.Count} quarter points berekend");
+	return (middlePoints, quarterPoints);
+}
+
+private void BuildMiddlePoints(List<Vector3> middlePoints)
+{
+	// Verwijder oude middle points
+	var old = GetNodeOrNull<MultiMeshInstance3D>("MiddlePoints");
+	if (old != null) old.QueueFree();
+	
+	if (!DrawMiddlePoints || middlePoints.Count == 0) return;
+	
+	Mesh baseMesh = UseSpheres
+		? new SphereMesh { Radius = MiddlePointSize * 0.5f, Height = MiddlePointSize, RadialSegments = 8, Rings = 4 }
+		: new BoxMesh { Size = new Vector3(MiddlePointSize, MiddlePointSize, MiddlePointSize) };
+	
+	var mat = new StandardMaterial3D { AlbedoColor = MiddlePointColor };
+	baseMesh.SurfaceSetMaterial(0, mat);
+	
+	var mm = new MultiMesh
+	{
+		Mesh = baseMesh,
+		TransformFormat = MultiMesh.TransformFormatEnum.Transform3D,
+		InstanceCount = middlePoints.Count
+	};
+	
+	for (int i = 0; i < middlePoints.Count; i++)
+		mm.SetInstanceTransform(i, new Transform3D(Basis.Identity, middlePoints[i]));
+	
+	var middleMmi = new MultiMeshInstance3D
+	{
+		Name = "MiddlePoints",
+		Multimesh = mm
+	};
+	
+	AddChild(middleMmi);
+	
+	GD.Print($"[MIDDLE POINTS] {middlePoints.Count} middle points getekend (oranje bollen)");
+}
+
+// ---------- QUARTER POINTS ----------
+private void BuildQuarterPoints(List<Vector3> quarterPoints)
+{
+	// Verwijder oude quarter points
+	var old = GetNodeOrNull<MultiMeshInstance3D>("QuarterPoints");
+	if (old != null) old.QueueFree();
+	
+	if (!DrawQuarterPoints || quarterPoints.Count == 0) return;
+	
+	Mesh baseMesh = UseSpheres
+		? new SphereMesh { Radius = QuarterPointSize * 0.5f, Height = QuarterPointSize, RadialSegments = 8, Rings = 4 }
+		: new BoxMesh { Size = new Vector3(QuarterPointSize, QuarterPointSize, QuarterPointSize) };
+	
+	var mat = new StandardMaterial3D { AlbedoColor = QuarterPointColor };
+	baseMesh.SurfaceSetMaterial(0, mat);
+	
+	var mm = new MultiMesh
+	{
+		Mesh = baseMesh,
+		TransformFormat = MultiMesh.TransformFormatEnum.Transform3D,
+		InstanceCount = quarterPoints.Count
+	};
+	
+	for (int i = 0; i < quarterPoints.Count; i++)
+		mm.SetInstanceTransform(i, new Transform3D(Basis.Identity, quarterPoints[i]));
+	
+	var quarterMmi = new MultiMeshInstance3D
+	{
+		Name = "QuarterPoints",
+		Multimesh = mm
+	};
+	
+	AddChild(quarterMmi);
+	
+	GD.Print($"[QUARTER POINTS] {quarterPoints.Count} quarter points getekend (rode bollen)");
 }
 
 // ---------- LEVEL LINES ----------
@@ -1089,7 +1612,167 @@ GD.Print($"[TOTAAL] {segments.Count} segmenten voor deduplicatie");
 
 	AddChild(new MultiMeshInstance3D { Name = "LevelBars", Multimesh = multiMesh });
 	
+	// Teken dimension labels op de lijnen
+	BuildDimensionLabels(finalSegs);
+	
 	return cornerPoints;
+}
+
+// ---------- DIMENSION LABELS ----------
+private void BuildDimensionLabels(List<(Vector3 a, Vector3 b)> segments)
+{
+	// Verwijder oude labels
+	var old = GetNodeOrNull<Node3D>("DimensionLabels");
+	if (old != null) old.QueueFree();
+	
+	// Clear oude data
+	_segmentsPerStep.Clear();
+	_labelNodesPerStep.Clear();
+	_labelToSegmentMap.Clear();
+	
+	if (!DrawDimensionLabels || segments.Count == 0) return;
+	
+	// Als ClickToShowDimensions AAN staat, groepeer segments per trede
+	if (ClickToShowDimensions)
+	{
+		// Groepeer segments op basis van Y-hoogte (per trede)
+		// BELANGRIJK: Filter alleen HORIZONTALE lijnen (niet verticale tussen treden)
+		foreach (var seg in segments)
+		{
+			// Check of het segment horizontaal is (beide punten op ongeveer dezelfde hoogte)
+			float heightDiff = Mathf.Abs(seg.a.Y - seg.b.Y);
+			
+			// Skip verticale lijnen (hoogteverschil groter dan 5cm)
+			if (heightDiff > 0.05f) continue;
+			
+			float avgY = (seg.a.Y + seg.b.Y) * 0.5f;
+			
+			// Vind bij welke trede dit segment hoort
+			int stepIndex = -1;
+			foreach (var kvp in _segmentsPerStep)
+			{
+				var existingSeg = kvp.Value[0];
+				float existingY = (existingSeg.a.Y + existingSeg.b.Y) * 0.5f;
+				
+				if (Mathf.Abs(avgY - existingY) <= LevelEpsilon)
+				{
+					stepIndex = kvp.Key;
+					break;
+				}
+			}
+			
+			// Nieuwe trede gevonden
+			if (stepIndex == -1)
+			{
+				stepIndex = _segmentsPerStep.Count;
+				_segmentsPerStep[stepIndex] = new List<(Vector3, Vector3)>();
+			}
+			
+			_segmentsPerStep[stepIndex].Add(seg);
+		}
+		
+		// Maak label nodes per trede (maar maak ze onzichtbaar)
+		var labelsParent = new Node3D { Name = "DimensionLabels" };
+		AddChild(labelsParent);
+		
+		foreach (var kvp in _segmentsPerStep)
+		{
+			int stepIndex = kvp.Key;
+			var stepSegments = kvp.Value;
+			
+			var stepLabelsNode = new Node3D { Name = $"StepLabels_{stepIndex}" };
+			stepLabelsNode.Visible = false; // Start onzichtbaar
+			labelsParent.AddChild(stepLabelsNode);
+			
+			int labelCount = 0;
+			int segmentIndex = 0;
+			foreach (var (pointA, pointB) in stepSegments)
+			{
+				Vector3 delta = pointB - pointA;
+				float distance = delta.Length();
+				
+				if (distance < 0.01f) continue;
+				
+				Vector3 midpoint = (pointA + pointB) * 0.5f;
+				Vector3 labelPosition = midpoint + new Vector3(0, LabelOffset, 0);
+				
+				string distanceText = ShowInCentimeters 
+					? $"{(distance * 100f):F1} cm" 
+					: $"{distance:F3} m";
+				
+				var label3D = new Label3D
+				{
+					Name = $"Label_{labelCount}",
+					Text = distanceText,
+					Position = labelPosition,
+					FontSize = (int)LabelFontSize,
+					Modulate = LabelColor,
+					Billboard = BaseMaterial3D.BillboardModeEnum.Enabled,
+					NoDepthTest = true,
+					OutlineSize = 8,
+					OutlineModulate = new Color(0, 0, 0, 0.8f)
+				};
+				
+				// Sla segment data op voor later bewerken
+				_labelToSegmentMap[label3D] = (pointA, pointB, segmentIndex);
+				
+				stepLabelsNode.AddChild(label3D);
+				labelCount++;
+				segmentIndex++;
+			}
+			
+			_labelNodesPerStep[stepIndex] = stepLabelsNode;
+		}
+		
+		GD.Print($"[DIMENSION LABELS] {_segmentsPerStep.Count} tredes met labels (klik op trede om te tonen)");
+	}
+	else
+	{
+		// Oude gedrag: toon alle labels direct (alleen horizontale lijnen)
+		var labelsParent = new Node3D { Name = "DimensionLabels" };
+		AddChild(labelsParent);
+		
+		int labelCount = 0;
+		
+		foreach (var (pointA, pointB) in segments)
+		{
+			// Check of het segment horizontaal is (niet verticaal)
+			float heightDiff = Mathf.Abs(pointA.Y - pointB.Y);
+			
+			// Skip verticale lijnen (hoogteverschil groter dan 5cm)
+			if (heightDiff > 0.05f) continue;
+			
+			Vector3 delta = pointB - pointA;
+			float distance = delta.Length();
+			
+			if (distance < 0.01f) continue;
+			
+			Vector3 midpoint = (pointA + pointB) * 0.5f;
+			Vector3 labelPosition = midpoint + new Vector3(0, LabelOffset, 0);
+			
+			string distanceText = ShowInCentimeters 
+				? $"{(distance * 100f):F1} cm" 
+				: $"{distance:F3} m";
+			
+			var label3D = new Label3D
+			{
+				Name = $"Label_{labelCount}",
+				Text = distanceText,
+				Position = labelPosition,
+				FontSize = (int)LabelFontSize,
+				Modulate = LabelColor,
+				Billboard = BaseMaterial3D.BillboardModeEnum.Enabled,
+				NoDepthTest = true,
+				OutlineSize = 8,
+				OutlineModulate = new Color(0, 0, 0, 0.8f)
+			};
+			
+			labelsParent.AddChild(label3D);
+			labelCount++;
+		}
+		
+		GD.Print($"[DIMENSION LABELS] {labelCount} horizontale afmetingen getekend (verticale lijnen uitgefilterd)");
+	}
 }
 
 // ---------- STAIR STEPS (GEVULDE TREDEN) ----------
@@ -1373,6 +2056,27 @@ private void BuildStairSteps(List<Vector3> pts, List<Vector3> cornerPoints)
 			Mesh = mesh,
 			Name = $"Step_{stepCount}"
 		};
+		
+		// Voeg een StaticBody3D toe voor klik-detectie (alleen in game, niet in editor)
+		if (!Engine.IsEditorHint() && ClickToShowDimensions)
+		{
+			var staticBody = new StaticBody3D
+			{
+				Name = $"StepCollider_{stepCount}"
+			};
+			
+			// Maak collision shape van de mesh
+			var collisionShape = new CollisionShape3D();
+			collisionShape.Shape = mesh.CreateTrimeshShape();
+			staticBody.AddChild(collisionShape);
+			
+			// BELANGRIJK: Sla de Y-hoogte op, niet de step counter
+			// Dit zorgt ervoor dat we de juiste segment groep kunnen vinden
+			float stepY = group[0].point.Y;
+			staticBody.SetMeta("step_y", stepY);
+			
+			meshInstance.AddChild(staticBody);
+		}
 
 		stepsParent.AddChild(meshInstance);
 		stepCount++;
